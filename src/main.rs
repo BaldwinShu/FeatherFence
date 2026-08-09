@@ -130,18 +130,19 @@ pub fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
         cfg.id = g.next_id;
         g.next_id += 1;
     }
-    // 默认位置:屏幕右上角级联
+    // 默认位置:屏幕右上角级联(按系统 DPI 缩放逻辑像素偏移;创建窗口前无 hwnd)
+    let ms = fence::dpi_scale();
     if cfg.x == 0 && cfg.y == 0 {
         let (sw, sh) = utils::screen_size();
         let n = g.fences.len();
-        cfg.x = (sw - 320 - 20 - (n as i32 % 5) * 30).max(0);
-        cfg.y = (80 + (n as i32 % 5) * 40).min((sh - 400).max(0));
+        cfg.x = (sw - (320.0 * ms) as i32 - (20.0 * ms) as i32 - (n as i32 % 5) * (30.0 * ms) as i32).max(0);
+        cfg.y = ((80.0 * ms) as i32 + (n as i32 % 5) * (40.0 * ms) as i32).min((sh - (400.0 * ms) as i32).max(0));
     }
-    if cfg.w < fence::min_w() {
-        cfg.w = fence::min_w();
+    if cfg.w < fence::min_w(ms) {
+        cfg.w = fence::min_w(ms);
     }
-    if cfg.h < fence::min_h() {
-        cfg.h = fence::min_h();
+    if cfg.h < fence::min_h(ms) {
+        cfg.h = fence::min_h(ms);
     }
 
     // 不挂 Progman(分层窗口+高 alpha+Progman 父窗口会触发 DWM 命中测试 bug,
@@ -199,7 +200,7 @@ pub fn delete_fence(g: &mut Global, idx: usize) {
 }
 
 fn sync_config(g: &mut Global) {
-    g.config.fences = g.fences.iter().map(|f| f.cfg.clone()).collect();
+    g.config.fences = fence::config_snapshot(&g.fences);
     config::save(&g.config);
 }
 
@@ -452,14 +453,15 @@ fn dispatch_menu(cmd: u32) {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "文件夹栅栏".into());
                     let (sw, _sh) = utils::screen_size();
+                    let s = fence::dpi_scale();
                     let cfg = FenceCfg {
                         id: g.next_id,
                         title,
                         folder: Some(folder),
-                        x: sw - 340,
-                        y: 100 + (g.fences.len() as i32 % 5) * 40,
-                        w: 280,
-                        h: 340,
+                        x: sw - (340.0 * s) as i32,
+                        y: (100.0 * s) as i32 + (g.fences.len() as i32 % 5) * (40.0 * s) as i32,
+                        w: (280.0 * s) as i32,
+                        h: (340.0 * s) as i32,
                         opacity: 0.74,
                         icon: 32,
                     };
@@ -494,14 +496,15 @@ fn dispatch_menu(cmd: u32) {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| "收纳箱".into());
                     // id 传 0,由 create_fence 分配新 id 并递增
+                    let s = fence::dpi_scale();
                     let cfg = FenceCfg {
                         id: 0,
                         title,
                         folder: Some(dir),
-                        x: sw - 320,
-                        y: 100 + (g.fences.len() as i32 % 5) * 40,
-                        w: 260,
-                        h: 340,
+                        x: sw - (320.0 * s) as i32,
+                        y: (100.0 * s) as i32 + (g.fences.len() as i32 % 5) * (40.0 * s) as i32,
+                        w: (260.0 * s) as i32,
+                        h: (340.0 * s) as i32,
                         opacity: 0.74,
                         icon: 32,
                     };
@@ -549,7 +552,8 @@ fn dispatch_menu(cmd: u32) {
         }
         MENU_RELOAD => {
             with_global(|g| {
-                let c = config::load();
+                let mut c = config::load();
+                config::normalize_dpi(&mut c);
                 g.config = c;
                 // 先销毁全部旧窗口(避免持借用调用 DestroyWindow)
                 let hwnds: Vec<HWND> = g.fences.iter().filter(|f| f.valid).map(|f| f.hwnd).collect();
@@ -676,6 +680,8 @@ fn main() {
     fence::register_class();
     dlog("[main] class registered");
     let mut cfg = config::load();
+    // 磁盘配置是逻辑像素 → 乘回当前系统 DPI 变物理像素;旧版物理像素原样保留(一次性迁移)
+    config::normalize_dpi(&mut cfg);
     // 一次性迁移:旧版图标尺寸存在栅栏上,现在全局统一。
     // 若全局未设,取第一个非零栅栏值;否则默认 32。
     if cfg.icon == 0 {
@@ -744,14 +750,15 @@ fn main() {
         // 首启:没有栅栏就建一个默认收纳箱(右侧),并保存配置
         if g.fences.is_empty() {
             let (sw, _sh) = utils::screen_size();
+            let s = fence::dpi_scale();
             let box_cfg = FenceCfg {
                 id: g.next_id,
                 title: "收纳箱".into(),
                 folder: None,
-                x: sw - 320,
-                y: 100,
-                w: 260,
-                h: 340,
+                x: sw - (320.0 * s) as i32,
+                y: (100.0 * s) as i32,
+                w: (260.0 * s) as i32,
+                h: (340.0 * s) as i32,
                 opacity: 0.74,
                 icon: 32,
             };

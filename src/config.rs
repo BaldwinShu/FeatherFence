@@ -66,6 +66,10 @@ pub struct Config {
     /// 全局图标尺寸(逻辑像素,默认 32)
     #[serde(default = "default_icon")]
     pub icon: u32,
+    /// 配置格式版本:>=2 表示栅栏 x/y/w/h 存逻辑像素(读写边界按 DPI 转换)。
+    /// 缺省/1 = 旧版物理像素,加载后由 normalize_dpi 一次性迁移。
+    #[serde(default)]
+    pub version: u32,
 }
 
 impl Default for Config {
@@ -77,8 +81,28 @@ impl Default for Config {
             autostart: false,
             vault_dir: None,
             icon: default_icon(),
+            version: 2,
         }
     }
+}
+
+/// 把磁盘配置转成本会话的物理像素布局:
+/// - 旧版(version < 2)配置是物理像素 → 原样保留(下次保存转逻辑像素,一次性迁移,现有布局零变化)。
+/// - v2+ 配置是逻辑像素 → 按当前系统 DPI 乘回物理像素。
+/// 调用点:进程启动 load() 之后、MENU_RELOAD 之后。
+pub fn normalize_dpi(c: &mut Config) {
+    if c.version >= 2 {
+        let s = crate::fence::dpi_scale();
+        if s != 1.0 {
+            for f in &mut c.fences {
+                f.x = (f.x as f32 * s).round() as i32;
+                f.y = (f.y as f32 * s).round() as i32;
+                f.w = (f.w as f32 * s).round() as i32;
+                f.h = (f.h as f32 * s).round() as i32;
+            }
+        }
+    }
+    c.version = 2;
 }
 
 pub fn config_dir() -> PathBuf {

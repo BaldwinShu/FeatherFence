@@ -1,4 +1,5 @@
 /target
+/target-clean/
 
 # 开发期探针/诊断脚本,不进入仓库
 /scripts/

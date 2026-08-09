@@ -46,6 +46,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ULW_ALPHA, UpdateLayeredWindow, WINDOW_STYLE, WNDCLASSW, WM_APP,
     WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER,
+    WM_DISPLAYCHANGE, WM_DPICHANGED,
     WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
@@ -74,22 +75,29 @@ fn enable_round(hwnd: HWND) {
     }
 }
 
-/// 系统 DPI 缩放因子(200% 缩放 = 2.0);窗口/字体按物理像素工作,必须乘这个因子
+/// 系统 DPI 缩放因子(200% 缩放 = 2.0);窗口/字体按物理像素工作,必须乘这个因子。
+/// 用于无窗口场景(重命名对话框、新建栅栏的 min 钳制);
+/// 窗口相关几何一律用 window_dpi(hwnd) / f.dpi,按窗口所在显示器缩放。
 pub fn dpi_scale() -> f32 {
     unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() as f32 / 96.0 }.max(1.0)
 }
-pub fn title_h() -> i32 {
-    (30.0 * dpi_scale()) as i32
+/// 窗口所在显示器 DPI 缩放因子(Per-Monitor):
+/// 副屏与主屏缩放不同时,按窗口实际所在屏缩放,而非系统(主屏)DPI
+fn window_dpi(hwnd: HWND) -> f32 {
+    unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32 / 96.0 }.max(1.0)
 }
-fn edge() -> i32 {
-    (8.0 * dpi_scale()) as i32
+pub fn title_h(d: f32) -> i32 {
+    (30.0 * d) as i32
 }
-fn margin() -> i32 {
-    (10.0 * dpi_scale()) as i32
+fn edge(d: f32) -> i32 {
+    (8.0 * d) as i32
+}
+fn margin(d: f32) -> i32 {
+    (10.0 * d) as i32
 }
 /// 页面圆点轨道宽度:图标网格让出右侧竖条,圆点不压到图标上
-fn rail() -> i32 {
-    (22.0 * dpi_scale()) as i32
+fn rail(d: f32) -> i32 {
+    (22.0 * d) as i32
 }
 /// 全局图标尺寸(逻辑像素):所有栅栏统一
 static ICON_PX: AtomicU32 = AtomicU32::new(32);
@@ -97,37 +105,37 @@ static ICON_PX: AtomicU32 = AtomicU32::new(32);
 pub fn set_icon_px(v: u32) {
     ICON_PX.store(v.max(16).min(128), AtomicOrdering::Relaxed);
 }
-/// 图标尺寸(物理像素,按 DPI 缩放);取全局值,0 时回退 32
-fn icon(_f: &Fence) -> i32 {
+/// 图标尺寸(物理像素,按所在屏 DPI 缩放);取全局值,0 时回退 32
+fn icon(f: &Fence) -> i32 {
     let base = ICON_PX.load(AtomicOrdering::Relaxed);
     let base = if base == 0 { 32 } else { base };
-    (base as f32 * dpi_scale()).round() as i32
+    (base as f32 * f.dpi).round() as i32
 }
-fn label_h() -> i32 {
+fn label_h(d: f32) -> i32 {
     // 容纳 12px 原生字号的两行标签(换行) + 投影
-    (38.0 * dpi_scale()) as i32
+    (38.0 * d) as i32
 }
 fn cell_w(f: &Fence) -> i32 {
     icon(f) + 12
 }
 fn cell_h(f: &Fence) -> i32 {
-    icon(f) + label_h()
+    icon(f) + label_h(f.dpi)
 }
-fn radius() -> f32 {
-    14.0 * dpi_scale()
+fn radius(d: f32) -> f32 {
+    14.0 * d
 }
-pub fn min_w() -> i32 {
-    (180.0 * dpi_scale()) as i32
+pub fn min_w(d: f32) -> i32 {
+    (180.0 * d) as i32
 }
-pub fn min_h() -> i32 {
-    (100.0 * dpi_scale()) as i32
+pub fn min_h(d: f32) -> i32 {
+    (100.0 * d) as i32
 }
-fn font_title() -> f32 {
-    11.5 * dpi_scale()
+fn font_title(d: f32) -> f32 {
+    11.5 * d
 }
-fn font_label() -> f32 {
+fn font_label(d: f32) -> f32 {
     // Windows 桌面图标的标签字号:9pt = 12px(逻辑像素,随 DPI 缩放)
-    12.0 * dpi_scale()
+    12.0 * d
 }
 const FONT_NAME: &str = "Microsoft YaHei UI";
 
@@ -155,6 +163,8 @@ pub enum ResizeDir {
 pub struct Fence {
     pub cfg: FenceCfg,
     pub hwnd: HWND,
+    /// 所在显示器的 DPI 缩放因子(Per-Monitor)。窗口跨屏/缩放变化时由 WM_DPICHANGED 更新。
+    pub dpi: f32,
     pub entries: Vec<Entry>,
     /// 当前页(0 基);滚动按整页切换
     pub page: usize,
@@ -186,6 +196,7 @@ impl Fence {
         Fence {
             cfg,
             hwnd,
+            dpi: window_dpi(hwnd),
             entries: Vec::new(),
             page: 0,
             top_row: 0.0,
@@ -457,7 +468,7 @@ pub fn fence_menu(hwnd: HWND) {
                         DestroyWindow(h);
                     }
                 }
-                g.config.fences = g.fences.iter().map(|f| f.cfg.clone()).collect();
+                g.config.fences = config_snapshot(&g.fences);
                 crate::config::save(&g.config);
             });
         } else if (1002..=1004).contains(&cmd) {
@@ -470,7 +481,7 @@ pub fn fence_menu(hwnd: HWND) {
                         _ => 0.45,
                     };
                     render_fence(&mut g.icons, ghost, &mut g.fences[idx]);
-                    g.config.fences = g.fences.iter().map(|f| f.cfg.clone()).collect();
+                    g.config.fences = config_snapshot(&g.fences);
                     crate::config::save(&g.config);
                 }
             });
@@ -514,7 +525,7 @@ fn rename_fence(hwnd: HWND) {
                     let ghost = g.config.ghost_mode;
                     g.fences[idx].cfg.title = name.clone();
                     render_fence(&mut g.icons, ghost, &mut g.fences[idx]);
-                    g.config.fences = g.fences.iter().map(|f| f.cfg.clone()).collect();
+                    g.config.fences = config_snapshot(&g.fences);
                     crate::config::save(&g.config);
                 }
             });
@@ -574,7 +585,8 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
         let _ = RegisterClassW(&wc);
     });
     unsafe {
-        let s = dpi_scale();
+        // 对话框随父栅栏所在显示器的 DPI 缩放(Per-Monitor)
+        let s = window_dpi(parent);
         let dw = (360.0 * s) as i32;
         let dh = (150.0 * s) as i32;
         let mut prc = RECT::default();
@@ -743,6 +755,7 @@ unsafe extern "system" fn fence_wndproc(
                     let mut need_render = false;
                     {
                         let f = &mut g.fences[idx];
+                        let d = f.dpi;
                         if ghost && !f.hover_visible {
                             f.hover_visible = true;
                             let mut tme = TRACKMOUSEEVENT {
@@ -788,19 +801,19 @@ unsafe extern "system" fn fence_wndproc(
                             let (mut nx, mut ny, mut nw, mut nh) = (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
                             let apply = |nx: &mut i32, ny: &mut i32, nw: &mut i32, nh: &mut i32, dir: ResizeDir| {
                                 match dir {
-                                    ResizeDir::E | ResizeDir::NE | ResizeDir::SE => *nw = (cur.x - *nx).max(min_w()),
+                                    ResizeDir::E | ResizeDir::NE | ResizeDir::SE => *nw = (cur.x - *nx).max(min_w(d)),
                                     ResizeDir::W | ResizeDir::NW | ResizeDir::SW => {
                                         let right = *nx + *nw;
-                                        *nx = cur.x.min(right - min_w());
+                                        *nx = cur.x.min(right - min_w(d));
                                         *nw = right - *nx;
                                     }
                                     _ => {}
                                 }
                                 match dir {
-                                    ResizeDir::S | ResizeDir::SE | ResizeDir::SW => *nh = (cur.y - *ny).max(min_h()),
+                                    ResizeDir::S | ResizeDir::SE | ResizeDir::SW => *nh = (cur.y - *ny).max(min_h(d)),
                                     ResizeDir::N | ResizeDir::NE | ResizeDir::NW => {
                                         let bottom = *ny + *nh;
-                                        *ny = cur.y.min(bottom - min_h());
+                                        *ny = cur.y.min(bottom - min_h(d));
                                         *nh = bottom - *ny;
                                     }
                                     _ => {}
@@ -809,10 +822,10 @@ unsafe extern "system" fn fence_wndproc(
                             apply(&mut nx, &mut ny, &mut nw, &mut nh, dir);
                             // 连续尺寸磁吸(平滑拉向整数格子,无跳变)+ clamp 工作区(防溢出)
                             let wa = work_area(hwnd);
-                            let nw2 = magnet_size_smooth(nw as f32, cell_w(f), 2 * margin() + rail(), 0.5).round() as i32;
-                            let nh2 = magnet_size_smooth(nh as f32, cell_h(f), title_h() + 2 * margin(), 0.5).round() as i32;
-                            let nw = nw2.min((wa.right - nx).max(min_w()));
-                            let nh = nh2.min((wa.bottom - ny).max(min_h()));
+                            let nw2 = magnet_size_smooth(nw as f32, cell_w(f), 2 * margin(d) + rail(d), 0.5).round() as i32;
+                            let nh2 = magnet_size_smooth(nh as f32, cell_h(f), title_h(d) + 2 * margin(d), 0.5).round() as i32;
+                            let nw = nw2.min((wa.right - nx).max(min_w(d)));
+                            let nh = nh2.min((wa.bottom - ny).max(min_h(d)));
                             let _ = SetWindowPos(hwnd, None, nx, ny, nw, nh, SWP_NOZORDER | SWP_NOACTIVATE);
                             // 实时跟随:同步 cfg 尺寸并重绘,内容平滑缩放(而非松手后瞬间刷新)。
                             // 每帧重新提交 ULW 表面,尺寸与窗口矩形保持一致。
@@ -880,7 +893,7 @@ unsafe extern "system" fn fence_wndproc(
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let f = &mut g.fences[idx];
-                    if y < title_h() {
+                    if y < title_h(f.dpi) {
                         f.moving = true;
                         let mut cur = POINT::default();
                         GetCursorPos(&mut cur);
@@ -924,7 +937,7 @@ unsafe extern "system" fn fence_wndproc(
         WM_LBUTTONDBLCLK => {
             let x = low16(lparam.0 as usize);
             let y = high16(lparam.0 as usize);
-            if y < title_h() {
+            if y < title_h(window_dpi(hwnd)) {
                 // 双击顶部栅栏名 → 重命名
                 rename_fence(hwnd);
                 return LRESULT(0);
@@ -1020,7 +1033,7 @@ unsafe extern "system" fn fence_wndproc(
                     GetCursorPos(&mut pt);
                     let mut cpt = pt;
                     windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut cpt);
-                    let cursor = if cpt.y < title_h() {
+                    let cursor = if cpt.y < title_h(f.dpi) {
                         IDC_SIZEALL
                     } else if let Some(d) = resize_dir_at(f, cpt.x, cpt.y) {
                         match d {
@@ -1038,6 +1051,82 @@ unsafe extern "system" fn fence_wndproc(
             });
             return LRESULT(1);
         }
+        WM_DPICHANGED => {
+            // Per-Monitor V2 下,窗口被拖到不同 DPI 的显示器 / 系统缩放变化时,
+            // 系统把窗口矩形缩放到建议矩形(并钳进新显示器工作区)。
+            // 按建议矩形应用,并把 f.dpi 切到新值 → 几何/渲染随新屏比例重算。
+            with_global(|g| {
+                if let Some(idx) = fence_idx(g, hwnd) {
+                    let newdpi = (wparam.0 & 0xFFFF) as u32;
+                    if newdpi == 0 {
+                        return;
+                    }
+                    let rect = unsafe { *(lparam.0 as *const RECT) };
+                    let nw = (rect.right - rect.left).max(1);
+                    let nh = (rect.bottom - rect.top).max(1);
+                    let f = &mut g.fences[idx];
+                    f.dpi = newdpi as f32 / 96.0;
+                    f.cfg.x = rect.left;
+                    f.cfg.y = rect.top;
+                    f.cfg.w = nw;
+                    f.cfg.h = nh;
+                    unsafe {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            rect.left,
+                            rect.top,
+                            nw,
+                            nh,
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                    sync_page(f);
+                    render_fence(&mut g.icons, g.config.ghost_mode, f);
+                    g.config.fences = config_snapshot(&g.fences);
+                    crate::config::save(&g.config);
+                }
+            });
+            return LRESULT(0);
+        }
+        WM_DISPLAYCHANGE => {
+            // 分辨率 / 显示器插拔变化:把本栅栏 clamp 回(新)工作区。
+            // 只做钳制不磁吸,避免分辨率变化时全部栅栏被吸附乱移。
+            with_global(|g| {
+                if let Some(idx) = fence_idx(g, hwnd) {
+                    let f = &mut g.fences[idx];
+                    f.dpi = window_dpi(hwnd);
+                    let d = f.dpi;
+                    let wa = work_area(hwnd);
+                    let nw = f.cfg.w.min(wa.right - wa.left).max(min_w(d));
+                    let nh = f.cfg.h.min(wa.bottom - wa.top).max(min_h(d));
+                    let nx = f.cfg.x.clamp(wa.left, (wa.right - nw).max(wa.left));
+                    let ny = f.cfg.y.clamp(wa.top, (wa.bottom - nh).max(wa.top));
+                    if nx != f.cfg.x || ny != f.cfg.y || nw != f.cfg.w || nh != f.cfg.h {
+                        f.cfg.x = nx;
+                        f.cfg.y = ny;
+                        f.cfg.w = nw;
+                        f.cfg.h = nh;
+                        unsafe {
+                            let _ = SetWindowPos(
+                                hwnd,
+                                None,
+                                nx,
+                                ny,
+                                nw,
+                                nh,
+                                SWP_NOZORDER | SWP_NOACTIVATE,
+                            );
+                        }
+                        sync_page(f);
+                        render_fence(&mut g.icons, g.config.ghost_mode, f);
+                        g.config.fences = config_snapshot(&g.fences);
+                        crate::config::save(&g.config);
+                    }
+                }
+            });
+            return LRESULT(0);
+        }
         _ => {}
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1046,9 +1135,10 @@ unsafe extern "system" fn fence_wndproc(
 fn grid_dims(f: &Fence) -> (i32, i32) {
     let w = f.cfg.w;
     let h = f.cfg.h;
+    let d = f.dpi;
     // 宽度让出右侧圆点轨道
-    let cols = ((w - 2 * margin() - rail()) / cell_w(f)).max(1);
-    let rows = ((h - title_h() - 2 * margin()) / cell_h(f)).max(0);
+    let cols = ((w - 2 * margin(d) - rail(d)) / cell_w(f)).max(1);
+    let rows = ((h - title_h(d) - 2 * margin(d)) / cell_h(f)).max(0);
     (cols, rows)
 }
 
@@ -1170,13 +1260,14 @@ fn magnet_size_smooth(v: f32, step: i32, base: i32, range: f32) -> f32 {
 
 /// 网格吸附后的完整尺寸:w = 2margin + rail + cols*cell, h = title + 2margin + rows*cell
 fn snap_size(f: &Fence, w: i32, h: i32) -> (i32, i32) {
+    let d = f.dpi;
     let cw = cell_w(f);
     let ch = cell_h(f);
-    let cols = (((w - 2 * margin() - rail()) as f32 / cw as f32).round().max(1.0)) as i32;
-    let rows = (((h - title_h() - 2 * margin()) as f32 / ch as f32).round().max(1.0)) as i32;
+    let cols = (((w - 2 * margin(d) - rail(d)) as f32 / cw as f32).round().max(1.0)) as i32;
+    let rows = (((h - title_h(d) - 2 * margin(d)) as f32 / ch as f32).round().max(1.0)) as i32;
     (
-        (2 * margin() + rail() + cols * cw).max(min_w()),
-        (title_h() + 2 * margin() + rows * ch).max(min_h()),
+        (2 * margin(d) + rail(d) + cols * cw).max(min_w(d)),
+        (title_h(d) + 2 * margin(d) + rows * ch).max(min_h(d)),
     )
 }
 
@@ -1239,19 +1330,38 @@ pub fn settle_fence(g: &mut crate::Global, idx: usize) {
     }
     sync_page(f);
     render_fence(&mut g.icons, ghost, f);
-    g.config.fences = g.fences.iter().map(|f| f.cfg.clone()).collect();
+    g.config.fences = config_snapshot(&g.fences);
     crate::config::save(&g.config);
+}
+
+/// 把运行时栅栏(物理像素)转成持久化配置(逻辑像素):
+/// x/y/w/h ÷ f.dpi,使同一份配置在不同 DPI 屏幕上打开时"逻辑布局一致"
+/// (物理尺寸成比例,图标/字体/格距保持一致)。
+pub fn config_snapshot(fences: &[Fence]) -> Vec<FenceCfg> {
+    fences
+        .iter()
+        .map(|f| {
+            let mut c = f.cfg.clone();
+            let s = f.dpi.max(1.0);
+            c.x = (c.x as f32 / s).round() as i32;
+            c.y = (c.y as f32 / s).round() as i32;
+            c.w = (c.w as f32 / s).round() as i32;
+            c.h = (c.h as f32 / s).round() as i32;
+            c
+        })
+        .collect()
 }
 
 fn hit_item(f: &Fence, x: i32, y: i32, cols: i32) -> Option<usize> {
     if f.entries.is_empty() {
         return None;
     }
-    if x < margin() || y < title_h() + margin() {
+    let d = f.dpi;
+    if x < margin(d) || y < title_h(d) + margin(d) {
         return None;
     }
-    let col = (x - margin()) / cell_w(f);
-    let row = (y - title_h() - margin()) / cell_h(f);
+    let col = (x - margin(d)) / cell_w(f);
+    let row = (y - title_h(d) - margin(d)) / cell_h(f);
     if col >= cols || row < 0 {
         return None;
     }
@@ -1267,10 +1377,11 @@ fn hit_item(f: &Fence, x: i32, y: i32, cols: i32) -> Option<usize> {
 
 fn resize_dir_at(f: &Fence, x: i32, y: i32) -> Option<ResizeDir> {
     let (w, h) = (f.cfg.w, f.cfg.h);
-    let left = x < edge();
-    let right = x >= w - edge();
-    let top = y < edge();
-    let bottom = y >= h - edge();
+    let e = edge(f.dpi);
+    let left = x < e;
+    let right = x >= w - e;
+    let top = y < e;
+    let bottom = y >= h - e;
     match (left, right, top, bottom) {
         (true, _, true, _) => Some(ResizeDir::NW),
         (true, _, false, true) => Some(ResizeDir::SW),
@@ -1413,11 +1524,12 @@ unsafe fn draw_page_dots(g: *mut GpGraphics, f: &Fence, w: i32, h: i32) {
     }
     // 连续页位置(0..pages-1),翻页动画中平滑移动
     let pfrac = f.top_row / rows as f32;
-    let dot_r = 2.5 * dpi_scale();
-    let spacing = 15.0 * dpi_scale();
-    let cy0 = (title_h() as f32 + h as f32) / 2.0 - spacing * (pages as f32 - 1.0) / 2.0;
+    let d = f.dpi;
+    let dot_r = 2.5 * d;
+    let spacing = 15.0 * d;
+    let cy0 = (title_h(d) as f32 + h as f32) / 2.0 - spacing * (pages as f32 - 1.0) / 2.0;
     // 圆点在右侧独立轨道内居中,不与图标网格重叠
-    let cx = w as f32 - margin() as f32 - rail() as f32 / 2.0;
+    let cx = w as f32 - margin(d) as f32 - rail(d) as f32 / 2.0;
     for p in 0..pages {
         let cy = cy0 + p as f32 * spacing;
         // 距当前页越近越亮越大
@@ -1479,6 +1591,8 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
         }
         GdipSetSmoothingMode(gfx, SmoothingModeAntiAlias);
         GdipSetTextRenderingHint(gfx, TextRenderingHintAntiAlias);
+        // 本帧按窗口所在显示器 DPI 缩放几何(Per-Monitor)
+        let d = f.dpi;
 
         // 半透明深色面板:分层窗口走逐像素 alpha,ULW 整幅提交,半透明像素直接透出
         // 桌面(真透明,无磨砂)。面板 = 透明度随 bg_alpha 缩放的深色盖层。
@@ -1494,7 +1608,7 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
         let mut fam: *mut GpFontFamily = std::ptr::null_mut();
         GdipCreateFontFamilyFromName(PCWSTR(wstr(FONT_NAME).as_ptr()), std::ptr::null_mut(), &mut fam);
         let mut font: *mut GpFont = std::ptr::null_mut();
-        GdipCreateFont(fam, font_title(), FontStyleRegular.0, UnitPixel, &mut font);
+        GdipCreateFont(fam, font_title(d), FontStyleRegular.0, UnitPixel, &mut font);
         let mut fmt: *mut GpStringFormat = std::ptr::null_mut();
         GdipCreateStringFormat(0, 0, &mut fmt);
         GdipSetStringFormatAlign(fmt, StringAlignmentCenter);
@@ -1507,8 +1621,8 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
         let title_rect = RectF {
             X: 0.0,
             Y: 0.0,
-            Width: (w - rail()).max(1) as f32,
-            Height: title_h() as f32,
+            Width: (w - rail(d)).max(1) as f32,
+            Height: title_h(d) as f32,
         };
         let display_title = if f.cfg.folder.is_some() && f.cfg.title.is_empty() {
             f.cfg
@@ -1534,11 +1648,11 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
             let (cols, rows) = grid_dims(f);
             grid_rows = rows;
             if rows > 0 {
-                let cell_w = (w - 2 * margin() - rail()) as f32 / cols.max(1) as f32;
+                let cell_w = (w - 2 * margin(d) - rail(d)) as f32 / cols.max(1) as f32;
                 let mut hover_brush: *mut GpSolidFill = std::ptr::null_mut();
                 GdipCreateSolidFill(0x22FFFFFF, &mut hover_brush);
                 let mut label_font: *mut GpFont = std::ptr::null_mut();
-                GdipCreateFont(fam, font_label(), FontStyleRegular.0, UnitPixel, &mut label_font);
+                GdipCreateFont(fam, font_label(d), FontStyleRegular.0, UnitPixel, &mut label_font);
                 let mut label_fmt: *mut GpStringFormat = std::ptr::null_mut();
                 GdipCreateStringFormat(0, 0, &mut label_fmt);
                 GdipSetStringFormatAlign(label_fmt, StringAlignmentCenter);
@@ -1562,7 +1676,7 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                 // 不含上下 margin:静止时相邻页的行恰好被完全裁掉(上一页最后一行
                 // 结束于裁剪区上沿,下一页第一行始于裁剪区下沿),动画中平滑进出;
                 // 若裁到 title_h 会把上一页标签/下一页图标漏进 margin 带 → 串页。
-                let clip_top = (title_h() + margin()) as f32;
+                let clip_top = (title_h(d) + margin(d)) as f32;
                 GdipSetClipRect(
                     gfx,
                     0.0,
@@ -1577,7 +1691,7 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                     if row < 0 {
                         continue;
                     }
-                    let y = title_h() as f32 + margin() as f32 + (row as f32 - f.top_row) * cell_h(f) as f32;
+                    let y = title_h(d) as f32 + margin(d) as f32 + (row as f32 - f.top_row) * cell_h(f) as f32;
                     if y >= h as f32 {
                         break;
                     }
@@ -1587,14 +1701,14 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                             break;
                         }
                         let e = &f.entries[idx2];
-                        let x = margin() as f32 + col as f32 * cell_w;
+                        let x = margin(d) as f32 + col as f32 * cell_w;
                         if f.hover == Some(idx2) {
                             fill_rounded(
                                 gfx,
                                 x - 3.0,
                                 y - 2.0,
                                 cell_w + 6.0,
-                                (icon(f) + label_h()) as f32 + 4.0,
+                                (icon(f) + label_h(d)) as f32 + 4.0,
                                 8.0,
                                 0x22FFFFFF,
                             );
@@ -1611,7 +1725,7 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                             X: x - 2.0,
                             Y: y + icon(f) as f32 + 3.0,
                             Width: cell_w + 4.0,
-                            Height: label_h() as f32 - 4.0,
+                            Height: label_h(d) as f32 - 4.0,
                         };
                         draw_label(
                             gfx,
@@ -1646,9 +1760,9 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
             GdipCreateSolidFill(0x99FFFFFF, &mut hint_brush);
             let hint_rect = RectF {
                 X: 10.0,
-                Y: title_h() as f32 + 10.0,
+                Y: title_h(d) as f32 + 10.0,
                 Width: (w - 20).max(1) as f32,
-                Height: (h - title_h() - 20).max(1) as f32,
+                Height: (h - title_h(d) - 20).max(1) as f32,
             };
             draw_text(gfx, font, hint_fmt, hint_brush as *const GpBrush, hint, hint_rect);
             GdipDeleteStringFormat(hint_fmt);
@@ -1668,7 +1782,7 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
         // GDI 不认 GDI+ 的裁剪区,这里单独给图标套一层 GDI 裁剪区(精确网格内容区),
         // 否则翻页动画中相邻页的图标会飘进 title/margin。
         let icol = icon(f);
-        let ctop = (title_h() + margin()) as i32;
+        let ctop = (title_h(d) + margin(d)) as i32;
         let cbot = ctop + grid_rows.max(0) * cell_h(f);
         let rgn = CreateRectRgn(0, ctop, w, cbot);
         if !rgn.is_invalid() {
