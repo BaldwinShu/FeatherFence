@@ -83,7 +83,7 @@ pub fn dpi_scale() -> f32 {
 }
 /// 窗口所在显示器 DPI 缩放因子(Per-Monitor):
 /// 副屏与主屏缩放不同时,按窗口实际所在屏缩放,而非系统(主屏)DPI
-fn window_dpi(hwnd: HWND) -> f32 {
+pub fn window_dpi(hwnd: HWND) -> f32 {
     unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32 / 96.0 }.max(1.0)
 }
 pub fn title_h(d: f32) -> i32 {
@@ -1070,6 +1070,7 @@ unsafe extern "system" fn fence_wndproc(
                     f.cfg.y = rect.top;
                     f.cfg.w = nw;
                     f.cfg.h = nh;
+                    f.cfg.dpi = newdpi;
                     unsafe {
                         let _ = SetWindowPos(
                             hwnd,
@@ -1334,19 +1335,15 @@ pub fn settle_fence(g: &mut crate::Global, idx: usize) {
     crate::config::save(&g.config);
 }
 
-/// 把运行时栅栏(物理像素)转成持久化配置(逻辑像素):
-/// x/y/w/h ÷ f.dpi,使同一份配置在不同 DPI 屏幕上打开时"逻辑布局一致"
-/// (物理尺寸成比例,图标/字体/格距保持一致)。
+/// 持久化运行时物理矩形及其窗口 DPI。
+/// 屏幕 x/y 不能除以窗口 DPI:它们位于跨显示器的全局坐标空间,
+/// 混合缩放时再统一乘系统 DPI不可逆。启动恢复只换算 w/h。
 pub fn config_snapshot(fences: &[Fence]) -> Vec<FenceCfg> {
     fences
         .iter()
         .map(|f| {
             let mut c = f.cfg.clone();
-            let s = f.dpi.max(1.0);
-            c.x = (c.x as f32 / s).round() as i32;
-            c.y = (c.y as f32 / s).round() as i32;
-            c.w = (c.w as f32 / s).round() as i32;
-            c.h = (c.h as f32 / s).round() as i32;
+            c.dpi = (f.dpi.max(1.0) * 96.0).round() as u32;
             c
         })
         .collect()
