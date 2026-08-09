@@ -138,11 +138,16 @@ pub fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
         cfg.x = (sw - (320.0 * ms) as i32 - (20.0 * ms) as i32 - (n as i32 % 5) * (30.0 * ms) as i32).max(0);
         cfg.y = ((80.0 * ms) as i32 + (n as i32 % 5) * (40.0 * ms) as i32).min((sh - (400.0 * ms) as i32).max(0));
     }
-    if cfg.w < fence::min_w(ms) {
-        cfg.w = fence::min_w(ms);
-    }
-    if cfg.h < fence::min_h(ms) {
-        cfg.h = fence::min_h(ms);
+    // 恢复配置时先按保存 DPI 钳制;窗口创建后再按实际窗口 DPI 做最终换算。
+    // 若这里使用系统 DPI,主屏 200% + 副屏 100% 会在创建副屏窗口前把尺寸错误放大。
+    if cfg.dpi != 0 {
+        let saved_scale = cfg.dpi as f32 / 96.0;
+        if cfg.w < fence::min_w(saved_scale) {
+            cfg.w = fence::min_w(saved_scale);
+        }
+        if cfg.h < fence::min_h(saved_scale) {
+            cfg.h = fence::min_h(saved_scale);
+        }
     }
 
     // 不挂 Progman(分层窗口+高 alpha+Progman 父窗口会触发 DWM 命中测试 bug,
@@ -159,6 +164,77 @@ pub fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     g.droptargets.push(it);
 
     let mut f = Fence::new(cfg, hwnd);
+    // v3 持久化保留物理屏幕位置,仅按保存时 DPI → 当前窗口 DPI 换算尺寸。
+    // 不能用系统 DPI 统一恢复:混合缩放多屏会把副屏窗口漂回主屏坐标。
+    let saved_dpi = f.cfg.dpi;
+    let saved_w = f.cfg.w;
+    let saved_h = f.cfg.h;
+    let mut current_dpi = (f.dpi * 96.0).round() as u32;
+    let mut converged = false;
+    // 尺寸变化可能让跨屏窗口的主显示器切换;重新读取实际 DPI,最多再换算一次。
+    for _ in 0..2 {
+        f.dpi = current_dpi as f32 / 96.0;
+        let restored_w = config::scale_extent_for_dpi(saved_w, saved_dpi, current_dpi)
+            .max(fence::min_w(f.dpi));
+        let restored_h = config::scale_extent_for_dpi(saved_h, saved_dpi, current_dpi)
+            .max(fence::min_h(f.dpi));
+        if restored_w != f.cfg.w || restored_h != f.cfg.h {
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    f.cfg.x,
+                    f.cfg.y,
+                    restored_w,
+                    restored_h,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            f.cfg.w = restored_w;
+            f.cfg.h = restored_h;
+        }
+        let observed_dpi = (fence::window_dpi(hwnd) * 96.0).round() as u32;
+        if observed_dpi == current_dpi {
+            converged = true;
+            break;
+        }
+        current_dpi = observed_dpi;
+    }
+    if !converged {
+        // 窗口卡在混合 DPI 屏幕边界时可能 A→B→A 振荡。选择当前实际显示器,
+        // 按其 DPI 计算尺寸并把窗口完整钳进工作区,得到确定的终止状态。
+        f.dpi = current_dpi as f32 / 96.0;
+        let wa = utils::work_area(hwnd);
+        let restored_w = config::scale_extent_for_dpi(saved_w, saved_dpi, current_dpi)
+            .max(fence::min_w(f.dpi))
+            .min(wa.right - wa.left);
+        let restored_h = config::scale_extent_for_dpi(saved_h, saved_dpi, current_dpi)
+            .max(fence::min_h(f.dpi))
+            .min(wa.bottom - wa.top);
+        let x = f.cfg.x.clamp(wa.left, (wa.right - restored_w).max(wa.left));
+        let y = f.cfg.y.clamp(wa.top, (wa.bottom - restored_h).max(wa.top));
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x,
+                y,
+                restored_w,
+                restored_h,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+    // 边界窗口可能在两种尺寸间切换主显示器。无论是否收敛,最终都以
+    // Win32 的实际 DPI 和窗口矩形为准,避免 cfg.dpi、f.dpi、w/h 互相矛盾。
+    f.dpi = fence::window_dpi(hwnd);
+    let mut final_rect = RECT::default();
+    unsafe { let _ = GetWindowRect(hwnd, &mut final_rect); }
+    f.cfg.x = final_rect.left;
+    f.cfg.y = final_rect.top;
+    f.cfg.w = (final_rect.right - final_rect.left).max(1);
+    f.cfg.h = (final_rect.bottom - final_rect.top).max(1);
+    f.cfg.dpi = (f.dpi * 96.0).round() as u32;
     fence::refresh_entries(&mut f, &config::vault_dir(&g.config));
     fence::render_fence(&mut g.icons, g.config.ghost_mode, &mut f);
     let id = f.cfg.id;
@@ -462,6 +538,7 @@ fn dispatch_menu(cmd: u32) {
                         y: (100.0 * s) as i32 + (g.fences.len() as i32 % 5) * (40.0 * s) as i32,
                         w: (280.0 * s) as i32,
                         h: (340.0 * s) as i32,
+                        dpi: (96.0 * s).round() as u32,
                         opacity: 0.74,
                         icon: 32,
                     };
@@ -505,6 +582,7 @@ fn dispatch_menu(cmd: u32) {
                         y: (100.0 * s) as i32 + (g.fences.len() as i32 % 5) * (40.0 * s) as i32,
                         w: (260.0 * s) as i32,
                         h: (340.0 * s) as i32,
+                        dpi: (96.0 * s).round() as u32,
                         opacity: 0.74,
                         icon: 32,
                     };
@@ -759,6 +837,7 @@ fn main() {
                 y: (100.0 * s) as i32,
                 w: (260.0 * s) as i32,
                 h: (340.0 * s) as i32,
+                dpi: (96.0 * s).round() as u32,
                 opacity: 0.74,
                 icon: 32,
             };
