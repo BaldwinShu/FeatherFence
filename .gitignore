@@ -1,0 +1,11 @@
+/target
+
+# 开发期探针/诊断脚本,不进入仓库
+/scripts/
+/src/*.py
+
+# 旧版设计稿
+/fence_final.png
+
+# Claude Code 本地设置
+.claude/
