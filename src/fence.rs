@@ -26,7 +26,7 @@ use windows::Win32::Graphics::GdiPlus::{
     CombineModeReplace, FillModeAlternate, FlushIntentionSync, FontStyleRegular, GpBrush, GpFont,
     GpFontFamily, GpGraphics, GpPath, GpSolidFill, GpStringFormat, RectF, SmoothingModeAntiAlias,
     StringAlignmentCenter, StringAlignmentNear, StringFormatFlagsNoWrap,
-    StringTrimmingEllipsisCharacter, TextRenderingHintAntiAlias, UnitPixel,
+    StringTrimmingEllipsisCharacter, TextRenderingHintAntiAliasGridFit, UnitPixel,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -1433,7 +1433,41 @@ unsafe fn draw_text(
     );
 }
 
-/// 文件名称:仿 Windows 桌面图标标签 —— 白色文字 + 深色投影(下移 1px),
+/// 绘制桌面图标式标签:先在八个方向各偏移 stroke 画一圈暗色描边,再画白色正文。
+/// 八方向(含对角)覆盖均匀,字周描边等宽、不偏侧;stroke 取 1 物理像素时描边纤细
+/// 不臃肿,又能在明暗壁纸上给白字衬出清晰边界——比只向一侧偏移的软投影更“实体”。
+unsafe fn draw_outlined_text(
+    g: *mut GpGraphics,
+    font: *const GpFont,
+    fmt: *const GpStringFormat,
+    outline: *const GpBrush,
+    white: *const GpBrush,
+    text: &str,
+    rect: RectF,
+    stroke: f32,
+) {
+    for (dx, dy) in [
+        (-stroke, 0.0),
+        (stroke, 0.0),
+        (0.0, -stroke),
+        (0.0, stroke),
+        (-stroke, -stroke),
+        (stroke, -stroke),
+        (-stroke, stroke),
+        (stroke, stroke),
+    ] {
+        let edge = RectF {
+            X: rect.X + dx,
+            Y: rect.Y + dy,
+            Width: rect.Width,
+            Height: rect.Height,
+        };
+        unsafe { draw_text(g, font, fmt, outline, text, edge) };
+    }
+    unsafe { draw_text(g, font, fmt, white, text, rect) };
+}
+
+/// 文件名称:仿 Windows 桌面图标标签 —— 白色文字 + 紧实深色描边,
 /// 单行放得下就单行,放不下自动两行,末行超长由 fmt 的省略号裁剪。
 unsafe fn draw_label(
     g: *mut GpGraphics,
@@ -1465,13 +1499,11 @@ unsafe fn draw_label(
             &mut lines,
         );
     }
+    // 描边固定 1 物理像素:整数偏移不会二次软化字形,八方向合起来仍是纤细一圈,
+    // 不随 DPI 变粗(此前 round(dpi) 在 1.5× 下取到 2px,把标签撑得又粗又糊)。
+    let stroke = 1.0_f32;
     if (fitted as usize) >= total && bbox.Width <= rect.Width + 0.5 {
-        // 单行:投影 + 主文字
-        let sh = RectF { X: rect.X, Y: rect.Y + 1.0, Width: rect.Width, Height: rect.Height };
-        unsafe {
-            draw_text(g, font, fmt, shadow, text, sh);
-            draw_text(g, font, fmt, white, text, rect);
-        }
+        unsafe { draw_outlined_text(g, font, fmt, shadow, white, text, rect, stroke) };
         return;
     }
     // 两行:第 1 行取能放下的字符数;若切点落在代理对中间(前一个码元是高代理)则前移
@@ -1487,13 +1519,9 @@ unsafe fn draw_label(
     let half = rect.Height / 2.0;
     let r1 = RectF { X: rect.X, Y: rect.Y, Width: rect.Width, Height: half };
     let r2 = RectF { X: rect.X, Y: rect.Y + half, Width: rect.Width, Height: half };
-    let sh1 = RectF { X: r1.X, Y: r1.Y + 1.0, Width: r1.Width, Height: r1.Height };
-    let sh2 = RectF { X: r2.X, Y: r2.Y + 1.0, Width: r2.Width, Height: r2.Height };
     unsafe {
-        draw_text(g, font, fmt, shadow, &line1, sh1);
-        draw_text(g, font, fmt, white, &line1, r1);
-        draw_text(g, font, fmt, shadow, &line2, sh2);
-        draw_text(g, font, fmt, white, &line2, r2);
+        draw_outlined_text(g, font, fmt, shadow, white, &line1, r1, stroke);
+        draw_outlined_text(g, font, fmt, shadow, white, &line2, r2, stroke);
     }
 }
 
@@ -1587,7 +1615,9 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
             return;
         }
         GdipSetSmoothingMode(gfx, SmoothingModeAntiAlias);
-        GdipSetTextRenderingHint(gfx, TextRenderingHintAntiAlias);
+        // GridFit 把字形笔画对齐到物理像素网格,比普通灰阶抗锯齿更接近
+        // Windows 桌面标签的紧实观感。ClearType 不适用于逐像素透明分层窗口。
+        GdipSetTextRenderingHint(gfx, TextRenderingHintAntiAliasGridFit);
         // 本帧按窗口所在显示器 DPI 缩放几何(Per-Monitor)
         let d = f.dpi;
 
@@ -1665,9 +1695,9 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                 let mut label_brush: *mut GpSolidFill = std::ptr::null_mut();
                 // 深色面板上用白色文字 + 深色投影(仿桌面图标标签)
                 GdipCreateSolidFill(0xFFFFFFFF, &mut label_brush);
-                // 标签投影:半透明黑,下移 1px,在深色面板上给白字衬出轮廓
+                // 高不透明度暗色细描边:避免半透明面板把抗锯齿边缘衬得发灰、虚浮。
                 let mut shadow_brush: *mut GpSolidFill = std::ptr::null_mut();
-                GdipCreateSolidFill(0x96000000, &mut shadow_brush);
+                GdipCreateSolidFill(0xD9000000, &mut shadow_brush);
 
                 // 网格裁剪到精确内容区:[title_h+margin, +rows*cell_h]。
                 // 不含上下 margin:静止时相邻页的行恰好被完全裁掉(上一页最后一行
