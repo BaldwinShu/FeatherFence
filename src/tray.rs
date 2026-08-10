@@ -9,7 +9,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, HICON, ICONINFO,
-    MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TrackPopupMenu, TPM_NONOTIFY, TPM_RETURNCMD,
+    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TrackPopupMenu, TPM_NONOTIFY,
+    TPM_RETURNCMD,
 };
 use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
 
@@ -29,6 +30,8 @@ pub const MENU_AUTOSTART: u32 = 2007;
 pub const MENU_CONFIG_DIR: u32 = 2008;
 pub const MENU_EXIT: u32 = 2009;
 pub const MENU_RELOAD: u32 = 2010;
+pub const MENU_DOWNLOAD_ENABLED: u32 = 2011;
+pub const MENU_DOWNLOAD_VISIBLE: u32 = 2012;
 
 pub fn make_tray_icon() -> HICON {
     // 16x16 三横条"栅栏"图标,带 alpha
@@ -108,7 +111,14 @@ pub fn remove_tray(hwnd: HWND) {
 }
 
 /// 弹出托盘菜单,返回用户选择的命令 ID(0 = 无)
-pub fn show_tray_menu(hwnd: HWND, zen: bool, ghost: bool, autostart: bool) -> u32 {
+pub fn show_tray_menu(
+    hwnd: HWND,
+    zen: bool,
+    ghost: bool,
+    autostart: bool,
+    download_enabled: bool,
+    download_visible: bool,
+) -> u32 {
     unsafe {
         let menu = CreatePopupMenu().unwrap_or_default();
         AppendMenuW(menu, MF_STRING, MENU_NEW_PORTAL as usize, PCWSTR(w!("新建文件夹栅栏…").as_ptr()));
@@ -128,6 +138,20 @@ pub fn show_tray_menu(hwnd: HWND, zen: bool, ghost: bool, autostart: bool) -> u3
             PCWSTR(w!("Ghost 模式(悬停显现)").as_ptr()),
         );
         AppendMenuW(menu, MF_STRING, MENU_SWEEP as usize, PCWSTR(w!("立即整理桌面").as_ptr()));
+        AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        AppendMenuW(
+            menu,
+            if download_enabled { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
+            MENU_DOWNLOAD_ENABLED as usize,
+            PCWSTR(w!("下载接管").as_ptr()),
+        );
+        let visible_flags = if download_visible { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED };
+        AppendMenuW(
+            menu,
+            if download_enabled { visible_flags } else { visible_flags | MF_GRAYED },
+            MENU_DOWNLOAD_VISIBLE as usize,
+            PCWSTR(w!("显示下载收纳箱").as_ptr()),
+        );
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         AppendMenuW(
             menu,

@@ -29,10 +29,13 @@ use windows::Win32::Graphics::GdiPlus::{
     StringAlignmentCenter, StringAlignmentNear, StringFormatFlagsNoWrap,
     StringTrimmingEllipsisCharacter, TextRenderingHintAntiAliasGridFit, UnitPixel,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    ShellExecuteW, SHFileOperationW, SHFILEOPSTRUCTW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
+    FOF_NOERRORUI, FO_DELETE,
+};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
+    ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TrackMouseEvent, VK_DELETE, TME_LEAVE,
     TRACKMOUSEEVENT, TRACKMOUSEEVENT_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -46,11 +49,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, DI_NORMAL, SC_MINIMIZE, SIZE_MINIMIZED,
     TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage,
     ULW_ALPHA, UpdateLayeredWindow, WINDOW_STYLE, WNDCLASSW, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFONT,
     WM_SIZE, WM_SYSCOMMAND, WM_TIMER,
     WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_EX_LAYERED,
     WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -183,6 +186,8 @@ pub struct Fence {
     /// 滚轮增量累加器(1/120 刻度):触控板/高精度滚轮的小增量先累积,满 120 再翻页
     pub wheel_acc: i32,
     pub hover: Option<usize>,
+    /// 单击选中的条目；Delete 键对它执行移入回收站。
+    pub selected: Option<usize>,
     pub moving: bool,
     pub move_off: (i32, i32),
     pub resizing: Option<ResizeDir>,
@@ -210,6 +215,7 @@ impl Fence {
             anim_from: 0.0,
             wheel_acc: 0,
             hover: None,
+            selected: None,
             moving: false,
             move_off: (0, 0),
             resizing: None,
@@ -335,7 +341,8 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
         let r = CreateWindowExW(
             // 分层窗口 + ULW 整幅提交:逐像素 alpha,半透明面板真透明透出桌面。
             // 圆角由 DWM 裁(DWMWCP_ROUND 对分层窗口同样生效)。
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+            // 启动时用 SW_SHOWNA 避免抢焦点；用户点击后允许激活，才能接收 Delete。
+            WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             w!("FeatherFence"),
             PCWSTR(title_w.as_ptr()),
             WS_POPUP,
@@ -402,6 +409,7 @@ pub fn schedule_render(hwnd: HWND) {
 /// 刷新栅栏条目:folder 指定则显示该文件夹;否则显示收纳箱(vault)目录。
 /// 这样拖入文件(handle_drop 把无 folder 的栅栏文件移进 vault)会立即显示,重启后也持久。
 pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
+    let selected_path = f.selected.and_then(|i| f.entries.get(i)).map(|e| e.path.clone());
     f.entries.clear();
     let dir = f.cfg.folder.clone().unwrap_or_else(|| vault.clone());
     if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -417,16 +425,56 @@ pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
     }
+    f.selected = selected_path.and_then(|p| f.entries.iter().position(|e| e.path == p));
     f.page = 0;
     f.top_row = 0.0;
     f.wheel_acc = 0;
     stop_page_anim(f);
 }
 
+fn recycle_path(hwnd: HWND, path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // SHFileOperationW 的 pFrom 是双 NUL 结尾的路径列表。
+    let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
+    from.push(0);
+    from.push(0);
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd,
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        pTo: PCWSTR::null(),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI).0 as u16,
+        ..Default::default()
+    };
+    let code = unsafe { SHFileOperationW(&mut op) };
+    if code == 0 && !op.fAnyOperationsAborted.as_bool() {
+        Ok(())
+    } else {
+        Err(format!("SHFileOperationW code={code}, aborted={}", op.fAnyOperationsAborted.as_bool()))
+    }
+}
+
 pub fn fence_menu(hwnd: HWND) {
     unsafe {
         let menu = CreatePopupMenu().unwrap_or_default();
-        AppendMenuW(menu, MF_STRING, 1001, PCWSTR(w!("删除此栅栏").as_ptr()));
+        let is_download = with_global(|g| {
+            fence_idx(g, hwnd).is_some_and(|i| g.config.download_box_id == Some(g.fences[i].cfg.id))
+        });
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            1001,
+            if is_download {
+                PCWSTR(w!("关闭下载接管").as_ptr())
+            } else {
+                PCWSTR(w!("删除此栅栏").as_ptr())
+            },
+        );
+        if is_download {
+            AppendMenuW(menu, MF_STRING, 1010, PCWSTR(w!("隐藏下载收纳箱").as_ptr()));
+        }
+        AppendMenuW(menu, MF_STRING, 1011, PCWSTR(w!("打开收纳箱").as_ptr()));
         AppendMenuW(menu, MF_STRING, 1005, PCWSTR(w!("重命名...").as_ptr()));
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         AppendMenuW(menu, MF_STRING, 1002, PCWSTR(w!("透明度 100%").as_ptr()));
@@ -466,8 +514,8 @@ pub fn fence_menu(hwnd: HWND) {
                 // 重建回来),列表条目删不掉,watchdog 定时器几秒后就会把栅栏重建回来
                 // = "删除无效"。先移除,WM_DESTROY 里 fence_idx 自然找不到,无副作用。
                 if let Some(idx) = g.fences.iter().position(|f| f.hwnd == hwnd) {
-                    // 下载接管依赖此专用栅栏；它可以移动/缩放/重命名，但不能删除。
                     if g.config.download_box_id == Some(g.fences[idx].cfg.id) {
+                        crate::set_download_enabled(g, false);
                         return;
                     }
                     let h = g.fences[idx].hwnd;
@@ -497,6 +545,24 @@ pub fn fence_menu(hwnd: HWND) {
         } else if cmd == 1005 {
             // 重命名:弹输入框 → 改 title → 存配置
             rename_fence(hwnd);
+        } else if cmd == 1010 {
+            with_global(|g| crate::set_download_box_visible(g, false));
+        } else if cmd == 1011 {
+            let folder = with_global(|g| {
+                fence_idx(g, hwnd)
+                    .and_then(|i| g.fences[i].cfg.folder.clone())
+                    .unwrap_or_else(|| crate::config::vault_dir(&g.config))
+            });
+            let _ = std::fs::create_dir_all(&folder);
+            let folder_w = wstr(&folder.to_string_lossy());
+            let _ = ShellExecuteW(
+                None,
+                PCWSTR(w!("explore").as_ptr()),
+                PCWSTR(folder_w.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            );
         } else if (1006..=1009).contains(&cmd) {
             let size = match cmd {
                 1006 => 24,
@@ -820,6 +886,28 @@ unsafe extern "system" fn fence_wndproc(
             });
             return LRESULT(0);
         }
+        WM_KEYDOWN if wparam.0 == VK_DELETE.0 as usize => {
+            let path = with_global(|g| {
+                let idx = fence_idx(g, hwnd)?;
+                let f = &g.fences[idx];
+                f.selected.and_then(|i| f.entries.get(i)).map(|e| e.path.clone())
+            });
+            if let Some(path) = path {
+                match recycle_path(hwnd, &path) {
+                    Ok(()) => with_global(|g| {
+                        if let Some(idx) = fence_idx(g, hwnd) {
+                            let ghost = g.config.ghost_mode;
+                            let f = &mut g.fences[idx];
+                            f.selected = None;
+                            refresh_entries(f, &crate::config::vault_dir(&g.config));
+                            render_fence(&mut g.icons, ghost, f);
+                        }
+                    }),
+                    Err(e) => crate::dlog(&format!("[delete] {}: {e}", path.display())),
+                }
+            }
+            return LRESULT(0);
+        }
         WM_MOUSEMOVE => {
             let x = low16(lparam.0 as usize);
             let y = high16(lparam.0 as usize);
@@ -966,8 +1054,12 @@ unsafe extern "system" fn fence_wndproc(
         WM_LBUTTONDOWN => {
             let x = low16(lparam.0 as usize);
             let y = high16(lparam.0 as usize);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetActiveWindow(hwnd);
+            let _ = SetFocus(Some(hwnd));
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
+                    let ghost = g.config.ghost_mode;
                     let f = &mut g.fences[idx];
                     if y < title_h(f.dpi) {
                         f.moving = true;
@@ -984,9 +1076,13 @@ unsafe extern "system" fn fence_wndproc(
                         // 按在图标上:记录潜在拖出,移动超阈值后由 WM_MOUSEMOVE 启动 OLE 拖拽
                         let (cols, _) = grid_dims(f);
                         if let Some(idx2) = hit_item(f, x, y, cols) {
+                            f.selected = Some(idx2);
                             f.drag_idx = Some(idx2);
                             f.drag_down = (x, y);
                             SetCapture(hwnd);
+                            render_fence(&mut g.icons, ghost, f);
+                        } else if f.selected.take().is_some() {
+                            render_fence(&mut g.icons, ghost, f);
                         }
                     }
                 }
@@ -997,12 +1093,15 @@ unsafe extern "system" fn fence_wndproc(
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let was_drag = g.fences[idx].moving || g.fences[idx].resizing.is_some();
+                    let had_item_press = g.fences[idx].drag_idx.is_some();
                     g.fences[idx].moving = false;
                     g.fences[idx].resizing = None;
                     // 普通单击(未达拖拽阈值)也会到这里:清除潜在拖出
                     g.fences[idx].drag_idx = None;
-                    if was_drag {
+                    if was_drag || had_item_press {
                         ReleaseCapture();
+                    }
+                    if was_drag {
                         // 松手整理:吸附网格尺寸/位置 + clamp 工作区 + 重叠推挤到空闲槽位 + 保存
                         settle_fence(g, idx);
                     }
@@ -1806,7 +1905,7 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                         }
                         let e = &f.entries[idx2];
                         let x = margin(d) as f32 + col as f32 * cell_w;
-                        if f.hover == Some(idx2) {
+                        if f.selected == Some(idx2) || f.hover == Some(idx2) {
                             fill_rounded(
                                 gfx,
                                 x - 3.0,
@@ -1814,7 +1913,7 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                                 cell_w + 6.0,
                                 (icon(f) + label_h(d)) as f32 + 4.0,
                                 8.0,
-                                0x22FFFFFF,
+                                if f.selected == Some(idx2) { 0x55FFFFFF } else { 0x22FFFFFF },
                             );
                         }
                         // 图标:收集位置,稍后由 GDI DrawIconEx 直绘(原生 alpha,透明区正确)

@@ -51,9 +51,9 @@ use windows::Win32::System::Ole::RegisterDragDrop;
 use config::{Config, FenceCfg};
 use fence::{Fence, WM_APP_DROP, WM_APP_REFRESH};
 use tray::{
-    TRAY_ID, WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX,
-    MENU_NEW_PORTAL, MENU_RELOAD, MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, add_tray, make_tray_icon,
-    remove_tray, show_tray_menu,
+    TRAY_ID, WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DOWNLOAD_ENABLED,
+    MENU_DOWNLOAD_VISIBLE, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX, MENU_NEW_PORTAL, MENU_RELOAD,
+    MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, add_tray, make_tray_icon, remove_tray, show_tray_menu,
 };
 use utils::wstr;
 
@@ -332,6 +332,47 @@ fn ensure_download_box(g: &mut Global) {
     }
 }
 
+fn is_download_box(g: &Global, id: u32) -> bool {
+    g.config.download_box_id == Some(id)
+}
+
+fn download_box_should_show(g: &Global, id: u32) -> bool {
+    !is_download_box(g, id) || (g.config.download_enabled && g.config.download_box_visible)
+}
+
+fn reset_download_tracking(g: &mut Global) {
+    while g.desktop_rx.try_recv().is_ok() {}
+    g.download_pending.clear();
+    g.desktop_seen = desktop_dir()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+}
+
+pub fn set_download_enabled(g: &mut Global, enabled: bool) {
+    if g.config.download_enabled == enabled {
+        return;
+    }
+    g.config.download_enabled = enabled;
+    reset_download_tracking(g);
+    apply_visibility(g);
+    reserve_desktop_icons(g);
+    config::save(&g.config);
+}
+
+pub fn set_download_box_visible(g: &mut Global, visible: bool) {
+    if g.config.download_box_visible == visible {
+        return;
+    }
+    g.config.download_box_visible = visible;
+    apply_visibility(g);
+    reserve_desktop_icons(g);
+    config::save(&g.config);
+}
+
 fn sync_config(g: &mut Global) {
     g.config.fences = fence::config_snapshot(&g.fences);
     config::save(&g.config);
@@ -343,7 +384,7 @@ fn apply_visibility(g: &mut Global) {
             continue;
         }
         unsafe {
-            if g.zen {
+            if g.zen || !download_box_should_show(g, f.cfg.id) {
                 ShowWindow(f.hwnd, SW_HIDE);
             } else {
                 ShowWindow(f.hwnd, SW_SHOWNA);
@@ -356,7 +397,7 @@ pub fn reserve_desktop_icons(g: &Global) {
     let rects: Vec<RECT> = g
         .fences
         .iter()
-        .filter(|f| f.valid)
+        .filter(|f| f.valid && download_box_should_show(g, f.cfg.id))
         .map(|f| RECT {
             left: f.cfg.x,
             top: f.cfg.y,
@@ -372,8 +413,11 @@ pub fn reserve_desktop_icons(g: &Global) {
 fn watchdog_tick(g: &mut Global) {
     // 窗口已独立于桌面层(不挂 Progman),无需宿主检测;
     // 之前 EnumWindows + SendMessageW(0x052C) 在 Progman 无响应时会卡死主线程
+    let download_id = g.config.download_box_id;
+    let download_shown = g.config.download_enabled && g.config.download_box_visible;
     for f in g.fences.iter_mut() {
-        if f.valid && !g.zen {
+        let intentionally_hidden = download_id == Some(f.cfg.id) && !download_shown;
+        if f.valid && !g.zen && !intentionally_hidden {
             let hidden_or_minimized = unsafe {
                 IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool()
             };
@@ -421,7 +465,11 @@ fn desktop_layer_tick(g: &mut Global) {
     }
     let Some(host) = g.desktop_host else { return };
     let mut anchor = host;
-    for f in g.fences.iter().filter(|f| f.valid) {
+    for f in g
+        .fences
+        .iter()
+        .filter(|f| f.valid && download_box_should_show(g, f.cfg.id))
+    {
         unsafe {
             if IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool() {
                 let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
@@ -485,7 +533,9 @@ fn ext_of(path: &Path) -> String {
 }
 
 pub fn sweep_desktop(g: &mut Global) {
-    ingest_desktop_events(g);
+    if g.config.download_enabled {
+        ingest_desktop_events(g);
+    }
     let Some(dir) = desktop_dir() else { return };
     let rules = g.config.sweep_rules.clone();
     if rules.is_empty() {
@@ -551,6 +601,11 @@ fn download_target(g: &Global) -> PathBuf {
 }
 
 fn download_tick(g: &mut Global) {
+    if !g.config.download_enabled {
+        while g.desktop_rx.try_recv().is_ok() {}
+        g.download_pending.clear();
+        return;
+    }
     ingest_desktop_events(g);
     let target = download_target(g);
     let mut completed = Vec::new();
@@ -684,8 +739,23 @@ unsafe extern "system" fn msg_wndproc(
         if action == windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP as u32
             || action == windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU as u32
         {
-            let (zen, ghost, autostart) = with_global(|g| (g.zen, g.config.ghost_mode, g.config.autostart));
-            let cmd = show_tray_menu(hwnd, zen, ghost, autostart);
+            let (zen, ghost, autostart, download_enabled, download_visible) = with_global(|g| {
+                (
+                    g.zen,
+                    g.config.ghost_mode,
+                    g.config.autostart,
+                    g.config.download_enabled,
+                    g.config.download_box_visible,
+                )
+            });
+            let cmd = show_tray_menu(
+                hwnd,
+                zen,
+                ghost,
+                autostart,
+                download_enabled,
+                download_visible,
+            );
             dispatch_menu(cmd);
         } else if action == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK as u32 {
             with_global(|g| {
@@ -824,6 +894,16 @@ fn dispatch_menu(cmd: u32) {
                 WPARAM(0),
                 LPARAM(0),
             ) };
+        }
+        MENU_DOWNLOAD_ENABLED => {
+            with_global(|g| set_download_enabled(g, !g.config.download_enabled));
+        }
+        MENU_DOWNLOAD_VISIBLE => {
+            with_global(|g| {
+                if g.config.download_enabled {
+                    set_download_box_visible(g, !g.config.download_box_visible);
+                }
+            });
         }
         MENU_AUTOSTART => {
             with_global(|g| {
@@ -1051,7 +1131,7 @@ fn main() {
         for fcfg in &fences {
             create_fence(g, fcfg.clone());
         }
-        // 始终保证有且只有一个可见的专用下载收纳箱。
+        // 始终保留专用下载收纳箱；是否接管/显示由两个独立配置控制。
         ensure_download_box(g);
         // 网格落位:恢复后把所有栅栏吸附到整数槽位、clamp 进工作区,
         // 并推挤消除重叠 —— 重启后布局也保持规整
@@ -1059,6 +1139,7 @@ fn main() {
         for i in 0..n {
             fence::settle_fence(g, i);
         }
+        apply_visibility(g);
         // 桌面自动归类监听:线程里只做扩展名粗筛,命中就通知主线程执行整理
         if let Some(dir) = desktop_dir() {
             let rules = g.config.sweep_rules.clone();
