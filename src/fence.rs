@@ -10,10 +10,11 @@ use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateRectRgn, DeleteDC,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateRectRgn, DeleteDC,
     DeleteObject, EndPaint, SelectClipRgn, SelectObject, AC_SRC_ALPHA,
-    AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HBRUSH, HBITMAP,
-    HDC, HGDIOBJ, PAINTSTRUCT,
+    AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DIB_RGB_COLORS, HBRUSH, HBITMAP,
+    HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
 };
 use windows::Win32::Graphics::GdiPlus::{
     GdipAddPathArc, GdipAddPathEllipse, GdipClosePathFigure, GdipCreateFont,
@@ -37,15 +38,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, DrawIconEx, GetCursorPos, GetMessageW, GetWindowRect, GetSystemMetrics,
-    GetWindowTextW, IsDialogMessageW, IsWindow, KillTimer, LoadCursorW, RegisterClassW, SetCursor,
-    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenu, BS_DEFPUSHBUTTON,
+    GetWindowTextW, IsDialogMessageW, IsWindow, KillTimer, LoadCursorW, PostMessageW, RegisterClassW,
+    SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenu, BS_DEFPUSHBUTTON,
     BS_PUSHBUTTON, CS_DBLCLKS, ES_AUTOHSCROLL, HICON, HMENU, HTCLIENT, IDC_ARROW, IDC_SIZENESW,
     IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_SIZEALL, MF_CHECKED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MSG, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW,
-    SW_SHOWNA, SW_SHOWNORMAL, DI_NORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage,
+    MF_STRING, MSG, SendMessageW, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW,
+    SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, DI_NORMAL, SC_MINIMIZE, SIZE_MINIMIZED,
+    TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage,
     ULW_ALPHA, UpdateLayeredWindow, WINDOW_STYLE, WNDCLASSW, WM_APP,
     WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFONT,
+    WM_SIZE, WM_SYSCOMMAND, WM_TIMER,
     WM_DISPLAYCHANGE, WM_DPICHANGED,
     WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
@@ -61,6 +64,8 @@ pub const WM_APP_REFRESH: u32 = WM_APP + 1;
 pub const WM_APP_DROP: u32 = WM_APP + 2;
 pub const WM_APP_MENU: u32 = WM_APP + 3;
 pub const WM_APP_RESIZED: u32 = WM_APP + 4;
+/// “显示桌面”会尝试最小化所有独立顶层窗口；异步恢复可避免在 WM_SIZE 内递归。
+pub const WM_APP_DESKTOP_RESTORE: u32 = WM_APP + 20;
 
 // --- 圆角:DWM 裁(DWMWCP_ROUND 对分层窗口同样生效) ---
 fn enable_round(hwnd: HWND) {
@@ -461,6 +466,10 @@ pub fn fence_menu(hwnd: HWND) {
                 // 重建回来),列表条目删不掉,watchdog 定时器几秒后就会把栅栏重建回来
                 // = "删除无效"。先移除,WM_DESTROY 里 fence_idx 自然找不到,无副作用。
                 if let Some(idx) = g.fences.iter().position(|f| f.hwnd == hwnd) {
+                    // 下载接管依赖此专用栅栏；它可以移动/缩放/重命名，但不能删除。
+                    if g.config.download_box_id == Some(g.fences[idx].cfg.id) {
+                        return;
+                    }
                     let h = g.fences[idx].hwnd;
                     g.fences.remove(idx);
                     unsafe {
@@ -586,9 +595,29 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
     });
     unsafe {
         // 对话框随父栅栏所在显示器的 DPI 缩放(Per-Monitor)
-        let s = window_dpi(parent);
-        let dw = (360.0 * s) as i32;
-        let dh = (150.0 * s) as i32;
+        let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(parent).max(96);
+        let s = (dpi as f32 / 96.0).max(1.0);
+        let px = |v: f32| (v * s) as i32;
+
+        // —— 客户区布局(所有子控件坐标都相对客户区左上角)——
+        let pad = px(18.0); // 四周内边距
+        let cw = px(360.0); // 客户区宽
+        let edit_y = pad;
+        let edit_h = px(30.0);
+        let bw = px(88.0); // 按钮宽
+        let bh = px(32.0); // 按钮高
+        let bgap = px(12.0); // 两按钮间距
+        let by = edit_y + edit_h + px(22.0); // 按钮行 Y
+        let ch = by + bh + pad; // 客户区高
+
+        // 由客户区尺寸反推整窗尺寸(含标题栏/边框),否则底部按钮会被裁掉
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        let exstyle = WS_EX_DLGMODALFRAME | WS_EX_TOOLWINDOW;
+        let mut wr = RECT { left: 0, top: 0, right: cw, bottom: ch };
+        let _ = windows::Win32::UI::HiDpi::AdjustWindowRectExForDpi(&mut wr, style, false, exstyle, dpi);
+        let dw = wr.right - wr.left;
+        let dh = wr.bottom - wr.top;
+
         let mut prc = RECT::default();
         GetWindowRect(parent, &mut prc);
         // 定位到栅栏附近,但不出屏幕工作区
@@ -597,10 +626,10 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
         let dy = (prc.top + (prc.bottom - prc.top - dh) / 3).clamp(wa.top, wa.bottom - dh);
 
         let dlg = CreateWindowExW(
-            WS_EX_DLGMODALFRAME | WS_EX_TOOLWINDOW,
+            exstyle,
             w!("FeatherInput"),
             PCWSTR(wstr(title).as_ptr()),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            style,
             dx,
             dy,
             dw,
@@ -611,6 +640,30 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
             None,
         )
         .ok()?;
+
+        // 按 DPI 缩放的界面字体(默认 SYSTEM_FONT 老旧且不缩放,换成雅黑更清晰)
+        let font = CreateFontW(
+            -px(15.0),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            0,
+            PCWSTR(wstr("Microsoft YaHei UI").as_ptr()),
+        );
+        let set_font = |h: HWND| {
+            if !font.is_invalid() {
+                let _ = SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+            }
+        };
+
         // 单行编辑框(初始文本由创建时窗口名带入)
         let edit = CreateWindowExW(
             Default::default(),
@@ -619,26 +672,24 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
             WINDOW_STYLE(
                 WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
             ),
-            (16.0 * s) as i32,
-            (38.0 * s) as i32,
-            dw - (32.0 * s) as i32,
-            (26.0 * s) as i32,
+            pad,
+            edit_y,
+            cw - pad * 2,
+            edit_h,
             Some(dlg),
             None,
             Some(crate::hinstance()),
             None,
         )
         .ok()?;
-        // 确定 / 取消
-        let bw = (80.0 * s) as i32;
-        let bh = (30.0 * s) as i32;
-        let by = dh - (56.0 * s) as i32;
-        let _ = CreateWindowExW(
+        set_font(edit);
+        // 确定 / 取消:右对齐排布
+        let ok = CreateWindowExW(
             Default::default(),
             w!("BUTTON"),
             PCWSTR(wstr("确定").as_ptr()),
             WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32),
-            dw - (188.0 * s) as i32,
+            cw - pad - bw * 2 - bgap,
             by,
             bw,
             bh,
@@ -646,13 +697,15 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
             Some(HMENU(1 as *mut std::ffi::c_void)),
             Some(crate::hinstance()),
             None,
-        );
-        let _ = CreateWindowExW(
+        )
+        .ok()?;
+        set_font(ok);
+        let cancel = CreateWindowExW(
             Default::default(),
             w!("BUTTON"),
             PCWSTR(wstr("取消").as_ptr()),
             WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
-            dw - (100.0 * s) as i32,
+            cw - pad - bw,
             by,
             bw,
             bh,
@@ -660,13 +713,17 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
             Some(HMENU(2 as *mut std::ffi::c_void)),
             Some(crate::hinstance()),
             None,
-        );
+        )
+        .ok()?;
+        set_font(cancel);
         *PROMPT_EDIT.lock().unwrap() = edit.0 as usize;
         *PROMPT_RESULT.lock().unwrap() = None;
         ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
         let _ = SetActiveWindow(dlg);
         let _ = SetFocus(Some(edit));
+        // 全选编辑框内容,方便直接改名
+        let _ = SendMessageW(edit, 0x00B1 /* EM_SETSEL */, Some(WPARAM(0)), Some(LPARAM(-1)));
         // 模态消息循环:直到对话框被销毁
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -677,6 +734,9 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
             if !IsWindow(Some(dlg)).as_bool() {
                 break;
             }
+        }
+        if !font.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(font.0));
         }
         PROMPT_RESULT.lock().unwrap().take()
     }
@@ -693,6 +753,22 @@ unsafe extern "system" fn fence_wndproc(
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
     match msg {
+        WM_SYSCOMMAND if (wparam.0 as u32 & 0xfff0) == SC_MINIMIZE => {
+            // 栅栏是桌面组件，不参与 Win+D / 任务栏“显示桌面”的最小化集合。
+            return LRESULT(0);
+        }
+        WM_SIZE if wparam.0 as u32 == SIZE_MINIMIZED => {
+            let _ = PostMessageW(Some(hwnd), WM_APP_DESKTOP_RESTORE, WPARAM(0), LPARAM(0));
+            return LRESULT(0);
+        }
+        WM_APP_DESKTOP_RESTORE => {
+            let should_show = with_global(|g| !g.zen && fence_idx(g, hwnd).is_some());
+            if should_show {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                schedule_render(hwnd);
+            }
+            return LRESULT(0);
+        }
         WM_ERASEBKGND => {
             // 背景由我们全量重绘(ULW 整幅替换),不做系统擦除 → 无闪烁
             return LRESULT(1);
@@ -1333,6 +1409,7 @@ pub fn settle_fence(g: &mut crate::Global, idx: usize) {
     render_fence(&mut g.icons, ghost, f);
     g.config.fences = config_snapshot(&g.fences);
     crate::config::save(&g.config);
+    crate::reserve_desktop_icons(g);
 }
 
 /// 持久化运行时物理矩形及其窗口 DPI。

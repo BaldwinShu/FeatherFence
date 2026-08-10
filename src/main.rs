@@ -5,6 +5,7 @@
 // 轻栅栏 feather-fences:超轻量桌面分区整理工具
 // Rust + Win32 原生实现,Fences 轻量版(GPL-3.0,受 Fluid Fences 概念启发,代码为原创)
 mod config;
+mod desktop_icons;
 mod dragout;
 mod droptarget;
 mod fence;
@@ -16,7 +17,9 @@ mod watcher;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::mem::size_of;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{w, PCWSTR};
@@ -35,10 +38,13 @@ use windows::Win32::UI::Shell::{
     BIF_RETURNONLYFSDIRS, BROWSEINFOW, FOLDERID_Desktop, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowRect,
-    HWND_MESSAGE, PostMessageW, PostQuitMessage, RegisterClassW, SetParent, SetWindowPos, ShowWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetMessageW, GetWindow, GetWindowRect, HWND_MESSAGE, HWND_TOP, IsIconic, IsWindow,
+    IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SetParent, SetWindowPos,
+    ShowWindow, GW_HWNDPREV,
     TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW, WNDPROC,
-    WS_POPUP, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
+    WS_POPUP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
+    SW_SHOWNOACTIVATE,
 };
 use windows::Win32::System::Ole::RegisterDragDrop;
 
@@ -62,11 +68,21 @@ pub struct Global {
     pub desktop_host: Option<HWND>,
     pub icons: icons::IconCache,
     pub sweep_retry: Vec<(PathBuf, PathBuf)>,
+    /// 桌面监听线程传来的文件名；主线程等待写入稳定后移入下载收纳箱。
+    pub desktop_rx: Receiver<Vec<String>>,
+    pub desktop_seen: HashSet<PathBuf>,
+    pub download_pending: HashMap<PathBuf, DownloadCandidate>,
     pub exiting: bool,
     /// 拖放 COM 对象,保持存活
     pub droptargets: Vec<windows::Win32::System::Ole::IDropTarget>,
     /// 目录监听线程
     pub watchers: Vec<watcher::DirWatcher>,
+}
+
+pub struct DownloadCandidate {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    stable_ticks: u8,
 }
 
 static G: OnceLock<Mutex<Global>> = OnceLock::new();
@@ -275,6 +291,47 @@ pub fn delete_fence(g: &mut Global, idx: usize) {
     sync_config(g);
 }
 
+fn ensure_download_box(g: &mut Global) {
+    let dir = config::download_box_dir();
+    let exists = g
+        .config
+        .download_box_id
+        .is_some_and(|id| g.fences.iter().any(|f| f.valid && f.cfg.id == id));
+    if exists {
+        return;
+    }
+    if let Some(id) = g
+        .fences
+        .iter()
+        .find(|f| f.valid && f.cfg.folder.as_deref() == Some(dir.as_path()))
+        .map(|f| f.cfg.id)
+    {
+        g.config.download_box_id = Some(id);
+        sync_config(g);
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let (sw, _sh) = utils::screen_size();
+    let s = fence::dpi_scale();
+    let cfg = FenceCfg {
+        id: 0,
+        title: "下载收纳箱".into(),
+        folder: Some(dir),
+        x: sw - (320.0 * s) as i32,
+        y: (100.0 * s) as i32,
+        w: (260.0 * s) as i32,
+        h: (340.0 * s) as i32,
+        dpi: (96.0 * s).round() as u32,
+        opacity: 0.74,
+        icon: 32,
+    };
+    let id = create_fence(g, cfg);
+    if id != 0 {
+        g.config.download_box_id = Some(id);
+        sync_config(g);
+    }
+}
+
 fn sync_config(g: &mut Global) {
     g.config.fences = fence::config_snapshot(&g.fences);
     config::save(&g.config);
@@ -295,12 +352,36 @@ fn apply_visibility(g: &mut Global) {
     }
 }
 
+pub fn reserve_desktop_icons(g: &Global) {
+    let rects: Vec<RECT> = g
+        .fences
+        .iter()
+        .filter(|f| f.valid)
+        .map(|f| RECT {
+            left: f.cfg.x,
+            top: f.cfg.y,
+            right: f.cfg.x + f.cfg.w,
+            bottom: f.cfg.y + f.cfg.h,
+        })
+        .collect();
+    desktop_icons::reserve(&rects);
+}
+
 // ---------- 桌面宿主重连(Explorer 重启防护) ----------
 
 fn watchdog_tick(g: &mut Global) {
     // 窗口已独立于桌面层(不挂 Progman),无需宿主检测;
     // 之前 EnumWindows + SendMessageW(0x052C) 在 Progman 无响应时会卡死主线程
     for f in g.fences.iter_mut() {
+        if f.valid && !g.zen {
+            let hidden_or_minimized = unsafe {
+                IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool()
+            };
+            if hidden_or_minimized {
+                unsafe { let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE); }
+                fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
+            }
+        }
         if !f.valid {
             // 窗口被 Explorer 销毁,重建
             let cfg = f.cfg.clone();
@@ -323,6 +404,42 @@ fn watchdog_tick(g: &mut Global) {
                 fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
             }
         }
+    }
+    // Explorer 重启、用户刷新桌面或新图标出现后，再次维护禁放区。
+    reserve_desktop_icons(g);
+}
+
+/// 维护严格的“所有应用窗口 > 栅栏 > Explorer 桌面”层级。
+/// 栅栏永不使用 TOPMOST；Show Desktop 改写 Z 序后，也只把它插回桌面宿主正上方。
+fn desktop_layer_tick(g: &mut Global) {
+    if g.zen {
+        return;
+    }
+    let host_valid = g.desktop_host.is_some_and(|h| unsafe { IsWindow(Some(h)).as_bool() });
+    if !host_valid {
+        g.desktop_host = utils::find_desktop_host();
+    }
+    let Some(host) = g.desktop_host else { return };
+    let mut anchor = host;
+    for f in g.fences.iter().filter(|f| f.valid) {
+        unsafe {
+            if IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool() {
+                let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+            }
+            let above = GetWindow(anchor, GW_HWNDPREV).unwrap_or(HWND_TOP);
+            if above != f.hwnd {
+                let _ = SetWindowPos(
+                    f.hwnd,
+                    Some(above),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+        anchor = f.hwnd;
     }
 }
 
@@ -368,6 +485,7 @@ fn ext_of(path: &Path) -> String {
 }
 
 pub fn sweep_desktop(g: &mut Global) {
+    ingest_desktop_events(g);
     let Some(dir) = desktop_dir() else { return };
     let rules = g.config.sweep_rules.clone();
     if rules.is_empty() {
@@ -377,6 +495,10 @@ pub fn sweep_desktop(g: &mut Global) {
     for e in rd.flatten() {
         let p = e.path();
         if !p.is_file() {
+            continue;
+        }
+        // 新下载优先进入下载收纳箱，不被扩展名清扫规则抢走。
+        if g.download_pending.contains_key(&p) {
             continue;
         }
         let ext = ext_of(&p);
@@ -390,6 +512,84 @@ pub fn sweep_desktop(g: &mut Global) {
             }
         }
     }
+}
+
+fn is_download_temp(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("crdownload" | "part" | "partial" | "download" | "tmp")
+    )
+}
+
+fn ingest_desktop_events(g: &mut Global) {
+    let Some(desktop) = desktop_dir() else { return };
+    while let Ok(names) = g.desktop_rx.try_recv() {
+        for name in names {
+            let path = desktop.join(name);
+            if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case("desktop.ini")) {
+                continue;
+            }
+            if path.is_file() && !is_download_temp(&path) && g.desktop_seen.insert(path.clone()) {
+                g.download_pending.insert(path, DownloadCandidate {
+                    len: u64::MAX,
+                    modified: None,
+                    stable_ticks: 0,
+                });
+            }
+        }
+    }
+    // 删除或已移动的路径不应永远占着 seen，允许日后同名下载再次被接管。
+    g.desktop_seen.retain(|p| p.exists());
+}
+
+fn download_target(g: &Global) -> PathBuf {
+    g.config
+        .download_box_id
+        .and_then(|id| g.fences.iter().find(|f| f.valid && f.cfg.id == id))
+        .and_then(|f| f.cfg.folder.clone())
+        .unwrap_or_else(config::download_box_dir)
+}
+
+fn download_tick(g: &mut Global) {
+    ingest_desktop_events(g);
+    let target = download_target(g);
+    let mut completed = Vec::new();
+    for (path, state) in g.download_pending.iter_mut() {
+        let Ok(meta) = std::fs::metadata(path) else {
+            completed.push(path.clone());
+            continue;
+        };
+        if !meta.is_file() {
+            completed.push(path.clone());
+            continue;
+        }
+        let modified = meta.modified().ok();
+        if state.len == meta.len() && state.modified == modified {
+            state.stable_ticks = state.stable_ticks.saturating_add(1);
+        } else {
+            state.len = meta.len();
+            state.modified = modified;
+            state.stable_ticks = 0;
+        }
+        // 连续约两秒无尺寸/时间变化后再移动，避免截断仍在写入的浏览器下载。
+        if state.stable_ticks >= 2 && watcher::move_to_dir(path, &target).is_ok() {
+            completed.push(path.clone());
+        }
+    }
+    if completed.is_empty() {
+        return;
+    }
+    for path in completed {
+        g.download_pending.remove(&path);
+        g.desktop_seen.remove(&path);
+    }
+    if let Some(id) = g.config.download_box_id {
+        if let Some(f) = g.fences.iter_mut().find(|f| f.valid && f.cfg.id == id) {
+            fence::refresh_entries(f, &config::vault_dir(&g.config));
+            fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
+        }
+    }
+    reserve_desktop_icons(g);
 }
 
 fn sweep_retry_tick(g: &mut Global) {
@@ -469,6 +669,8 @@ fn set_autostart(enabled: bool) {
 
 const TID_WATCHDOG: usize = 1;
 const TID_SWEEP_RETRY: usize = 3;
+const TID_DOWNLOADS: usize = 4;
+const TID_DESKTOP_LAYER: usize = 5;
 const WM_APP_SWEEP: u32 = WM_APP + 5;
 
 unsafe extern "system" fn msg_wndproc(
@@ -504,6 +706,8 @@ unsafe extern "system" fn msg_wndproc(
         match wparam.0 {
             TID_WATCHDOG => with_global(|g| watchdog_tick(g)),
             TID_SWEEP_RETRY => with_global(|g| sweep_retry_tick(g)),
+            TID_DOWNLOADS => with_global(|g| download_tick(g)),
+            TID_DESKTOP_LAYER => with_global(|g| desktop_layer_tick(g)),
             _ => {}
         }
         return LRESULT(0);
@@ -647,6 +851,7 @@ fn dispatch_menu(cmd: u32) {
                 for cfg in g.config.fences.clone() {
                     create_fence(g, cfg);
                 }
+                ensure_download_box(g);
                 apply_visibility(g);
             });
         }
@@ -774,6 +979,12 @@ fn main() {
     let vault = config::vault_dir(&cfg);
     let _ = std::fs::create_dir_all(&vault);
 
+    let (desktop_tx, desktop_rx) = mpsc::channel::<Vec<String>>();
+    let desktop_seen = desktop_dir()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+
     G.set(Mutex::new(Global {
         config: cfg.clone(),
         next_id: cfg.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1,
@@ -783,6 +994,9 @@ fn main() {
         desktop_host: None,
         icons: icons::IconCache::new(),
         sweep_retry: Vec::new(),
+        desktop_rx,
+        desktop_seen,
+        download_pending: HashMap::new(),
         exiting: false,
         droptargets: Vec::new(),
         watchers: Vec::new(),
@@ -812,6 +1026,18 @@ fn main() {
         );
         let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
             Some(msg_hwnd),
+            TID_DOWNLOADS,
+            1000,
+            None,
+        );
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+            Some(msg_hwnd),
+            TID_DESKTOP_LAYER,
+            150,
+            None,
+        );
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+            Some(msg_hwnd),
             TID_SWEEP_RETRY,
             2000,
             None,
@@ -825,27 +1051,8 @@ fn main() {
         for fcfg in &fences {
             create_fence(g, fcfg.clone());
         }
-        // 首启:没有栅栏就建一个默认收纳箱(右侧),并保存配置
-        if g.fences.is_empty() {
-            let (sw, _sh) = utils::screen_size();
-            let s = fence::dpi_scale();
-            let box_cfg = FenceCfg {
-                id: g.next_id,
-                title: "收纳箱".into(),
-                folder: None,
-                x: sw - (320.0 * s) as i32,
-                y: (100.0 * s) as i32,
-                w: (260.0 * s) as i32,
-                h: (340.0 * s) as i32,
-                dpi: (96.0 * s).round() as u32,
-                opacity: 0.74,
-                icon: 32,
-            };
-            // 创建成功才保存,避免失败时把配置覆盖成空
-            if create_fence(g, box_cfg) != 0 {
-                sync_config(g);
-            }
-        }
+        // 始终保证有且只有一个可见的专用下载收纳箱。
+        ensure_download_box(g);
         // 网格落位:恢复后把所有栅栏吸附到整数槽位、clamp 进工作区,
         // 并推挤消除重叠 —— 重启后布局也保持规整
         let n = g.fences.len();
@@ -856,11 +1063,10 @@ fn main() {
         if let Some(dir) = desktop_dir() {
             let rules = g.config.sweep_rules.clone();
             let mhwnd = g.msg_hwnd.0 as usize;
+            let tx = desktop_tx.clone();
             let watcher = watcher::spawn_dir_watcher(dir.clone(), move |names| {
-                if rules.is_empty() {
-                    return;
-                }
-                for n in names {
+                let _ = tx.send(names.clone());
+                for n in &names {
                     let ext = Path::new(&n)
                         .extension()
                         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
@@ -880,6 +1086,7 @@ fn main() {
             });
             g.watchers.push(watcher);
         }
+        reserve_desktop_icons(g);
     });
 
     dlog(&format!("[main] started, fences: {}", fences.len()));

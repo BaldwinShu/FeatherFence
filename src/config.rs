@@ -67,6 +67,9 @@ pub struct Config {
     pub autostart: bool,
     #[serde(default)]
     pub vault_dir: Option<PathBuf>,
+    /// 专用“下载收纳箱”的栅栏 id。程序只接管启动后新出现在桌面的文件。
+    #[serde(default)]
+    pub download_box_id: Option<u32>,
     /// 全局图标尺寸(逻辑像素,默认 32)
     #[serde(default = "default_icon")]
     pub icon: u32,
@@ -86,6 +89,7 @@ impl Default for Config {
             ghost_mode: false,
             autostart: false,
             vault_dir: None,
+            download_box_id: None,
             icon: default_icon(),
             version: 3,
         }
@@ -185,6 +189,10 @@ pub fn config_path() -> PathBuf {
 
 pub fn default_vault_dir() -> PathBuf {
     config_dir().join("vault")
+}
+
+pub fn download_box_dir() -> PathBuf {
+    config_dir().join("boxes").join("下载收纳箱")
 }
 
 pub fn vault_dir(c: &Config) -> PathBuf {
