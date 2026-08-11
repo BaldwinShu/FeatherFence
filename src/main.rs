@@ -49,7 +49,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::System::Ole::RegisterDragDrop;
 
 use config::{Config, FenceCfg};
-use fence::{Fence, WM_APP_DROP, WM_APP_REFRESH};
+use fence::{Fence, WM_APP_DROP};
 use tray::{
     TRAY_ID, WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DOWNLOAD_ENABLED,
     MENU_DOWNLOAD_VISIBLE, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX, MENU_NEW_PORTAL, MENU_RELOAD,
@@ -288,17 +288,15 @@ pub fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     fence::settle_fence(g, new_idx);
 
     // 门户目录监听
-    if let Some(folder) = g.fences.last().and_then(|f| f.cfg.folder.clone()) {
+    if let Some((folder, refresh_signal)) = g.fences.last().and_then(|f| {
+        f.cfg
+            .folder
+            .clone()
+            .map(|folder| (folder, f.refresh_signal.clone()))
+    }) {
         let hwnd2 = hwnd.0 as usize;
         let watcher = watcher::spawn_dir_watcher(folder, move |_names| {
-            unsafe {
-                PostMessageW(
-                    Some(HWND(hwnd2 as *mut c_void)),
-                    WM_APP_REFRESH,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-            }
+            refresh_signal.post(HWND(hwnd2 as *mut c_void));
         });
         g.watchers.push(ManagedWatcher::fence(id, watcher));
     }

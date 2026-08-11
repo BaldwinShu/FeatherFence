@@ -6,6 +6,8 @@
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -154,6 +156,96 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
+struct RefreshState {
+    queued: bool,
+    last_event: Instant,
+}
+
+impl Default for RefreshState {
+    fn default() -> Self {
+        Self {
+            queued: false,
+            last_event: Instant::now(),
+        }
+    }
+}
+
+impl RefreshState {
+    fn record_event(&mut self, now: Instant) -> bool {
+        self.last_event = now;
+        if self.queued {
+            false
+        } else {
+            self.queued = true;
+            true
+        }
+    }
+
+    fn timer_action(&mut self, now: Instant, delay: Duration) -> RefreshTimerAction {
+        if !self.queued {
+            return RefreshTimerAction::Idle;
+        }
+        let elapsed = now.saturating_duration_since(self.last_event);
+        if elapsed < delay {
+            let remaining = delay - elapsed;
+            return RefreshTimerAction::Wait(
+                remaining.as_millis().clamp(1, u32::MAX as u128) as u32,
+            );
+        }
+        self.queued = false;
+        RefreshTimerAction::Refresh
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefreshTimerAction {
+    Idle,
+    Wait(u32),
+    Refresh,
+}
+
+#[derive(Clone, Default)]
+pub struct RefreshSignal {
+    state: Arc<Mutex<RefreshState>>,
+}
+
+impl RefreshSignal {
+    /// 同一栅栏最多排队一条刷新消息，避免目录事件风暴淹没 UI 消息队列。
+    pub fn post(&self, hwnd: HWND) {
+        let should_post = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_event(Instant::now());
+        if !should_post {
+            return;
+        }
+        let posted = unsafe {
+            PostMessageW(Some(hwnd), WM_APP_REFRESH, WPARAM(0), LPARAM(0))
+        };
+        if posted.is_err() {
+            self.cancel();
+        }
+    }
+
+    fn timer_action(&self) -> RefreshTimerAction {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .timer_action(
+                Instant::now(),
+                Duration::from_millis(REFRESH_DEBOUNCE_MS as u64),
+            )
+    }
+
+    fn cancel(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .queued = false;
+    }
+}
+
 unsafe impl Send for Fence {}
 
 #[derive(Clone, Copy, PartialEq)]
@@ -196,6 +288,8 @@ pub struct Fence {
     pub drag_idx: Option<usize>,
     /// 拖出:按下时的客户区坐标(拖拽阈值判断用)
     pub drag_down: (i32, i32),
+    /// 目录监听线程与窗口消息之间的刷新合并信号。
+    pub refresh_signal: RefreshSignal,
     /// 已渲染 DIB 缓存:ULW 整幅提交的源(内容不保留,必须自己存)
     pub cache: Option<RenderCache>,
     pub valid: bool,
@@ -222,6 +316,7 @@ impl Fence {
             hover_visible: false,
             drag_idx: None,
             drag_down: (0, 0),
+            refresh_signal: RefreshSignal::default(),
             cache: None,
             valid: true,
         }
@@ -409,6 +504,7 @@ pub fn schedule_render(hwnd: HWND) {
 /// 刷新栅栏条目:folder 指定则显示该文件夹;否则显示收纳箱(vault)目录。
 /// 这样拖入文件(handle_drop 把无 folder 的栅栏文件移进 vault)会立即显示,重启后也持久。
 pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
+    let page = f.page;
     let selected_path = f.selected.and_then(|i| f.entries.get(i)).map(|e| e.path.clone());
     f.entries.clear();
     let dir = f.cfg.folder.clone().unwrap_or_else(|| vault.clone());
@@ -426,10 +522,78 @@ pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
         });
     }
     f.selected = selected_path.and_then(|p| f.entries.iter().position(|e| e.path == p));
-    f.page = 0;
-    f.top_row = 0.0;
+    f.page = page;
     f.wheel_acc = 0;
-    stop_page_anim(f);
+    sync_page(f);
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::{
+        grid_dims, refresh_entries, Fence, RefreshState, RefreshTimerAction,
+        REFRESH_DEBOUNCE_MS,
+    };
+    use crate::config::FenceCfg;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use windows::Win32::Foundation::HWND;
+
+    #[test]
+    fn refresh_state_coalesces_events_until_the_quiet_period() {
+        let mut state = RefreshState::default();
+        let start = Instant::now();
+        let delay = Duration::from_millis(REFRESH_DEBOUNCE_MS as u64);
+
+        assert!(state.record_event(start));
+        assert!(!state.record_event(start + Duration::from_millis(50)));
+        assert_eq!(
+            state.timer_action(start + Duration::from_millis(150), delay),
+            RefreshTimerAction::Wait(50)
+        );
+        assert_eq!(
+            state.timer_action(start + Duration::from_millis(200), delay),
+            RefreshTimerAction::Refresh
+        );
+        assert_eq!(
+            state.timer_action(start + Duration::from_millis(201), delay),
+            RefreshTimerAction::Idle
+        );
+        assert!(state.record_event(start + Duration::from_millis(202)));
+    }
+
+    #[test]
+    fn refresh_preserves_page_and_clamps_when_contents_shrink() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "feather-fences-refresh-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..40 {
+            std::fs::write(dir.join(format!("item-{i:02}.txt")), b"item").unwrap();
+        }
+
+        let cfg = FenceCfg {
+            folder: Some(dir.clone()),
+            ..FenceCfg::default()
+        };
+        let mut fence = Fence::new(cfg, HWND::default());
+        fence.page = 1;
+        refresh_entries(&mut fence, &dir);
+        assert_eq!(fence.page, 1);
+        assert_eq!(fence.top_row, grid_dims(&fence).1 as f32);
+
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+        refresh_entries(&mut fence, &dir);
+        assert_eq!(fence.page, 0);
+        assert_eq!(fence.top_row, 0.0);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 fn recycle_path(hwnd: HWND, path: &std::path::Path) -> Result<(), String> {
@@ -856,10 +1020,11 @@ unsafe extern "system" fn fence_wndproc(
         WM_APP_REFRESH => {
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
-                    let ghost = g.config.ghost_mode;
-                    let f = &mut g.fences[idx];
-                    refresh_entries(f, &crate::config::vault_dir(&g.config));
-                    render_fence(&mut g.icons, ghost, f);
+                    // 后续事件只更新时间戳，不再投递消息；计时器到期时检查安静期。
+                    if !restart_refresh_timer(hwnd, REFRESH_DEBOUNCE_MS) {
+                        g.fences[idx].refresh_signal.cancel();
+                        refresh_fence_now(g, idx);
+                    }
                 }
             });
             return LRESULT(0);
@@ -867,10 +1032,9 @@ unsafe extern "system" fn fence_wndproc(
         WM_APP_DROP => {
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
-                    let ghost = g.config.ghost_mode;
-                    let f = &mut g.fences[idx];
-                    refresh_entries(f, &crate::config::vault_dir(&g.config));
-                    render_fence(&mut g.icons, ghost, f);
+                    g.fences[idx].refresh_signal.cancel();
+                    stop_refresh_timer(hwnd);
+                    refresh_fence_now(g, idx);
                 }
             });
             return LRESULT(0);
@@ -1164,7 +1328,25 @@ unsafe extern "system" fn fence_wndproc(
             return LRESULT(0);
         }
         WM_TIMER => {
-            if wparam.0 == ANIM_TICK {
+            if wparam.0 == REFRESH_TICK {
+                with_global(|g| {
+                    if let Some(idx) = fence_idx(g, hwnd) {
+                        match g.fences[idx].refresh_signal.timer_action() {
+                            RefreshTimerAction::Idle => stop_refresh_timer(hwnd),
+                            RefreshTimerAction::Wait(delay_ms) => {
+                                if !restart_refresh_timer(hwnd, delay_ms) {
+                                    g.fences[idx].refresh_signal.cancel();
+                                    refresh_fence_now(g, idx);
+                                }
+                            }
+                            RefreshTimerAction::Refresh => {
+                                stop_refresh_timer(hwnd);
+                                refresh_fence_now(g, idx);
+                            }
+                        }
+                    }
+                });
+            } else if wparam.0 == ANIM_TICK {
                 with_global(|g| {
                     if let Some(idx) = fence_idx(g, hwnd) {
                         let f = &mut g.fences[idx];
@@ -1324,6 +1506,28 @@ fn total_pages(f: &Fence) -> usize {
 
 /// 翻页动画计时器 ID
 const ANIM_TICK: usize = 0xFE10;
+/// 目录变化刷新计时器：连续事件安静一小段时间后再扫描和重绘。
+const REFRESH_TICK: usize = 0xFE11;
+const REFRESH_DEBOUNCE_MS: u32 = 150;
+
+fn stop_refresh_timer(hwnd: HWND) {
+    unsafe {
+        let _ = KillTimer(Some(hwnd), REFRESH_TICK);
+    }
+}
+
+fn restart_refresh_timer(hwnd: HWND, delay_ms: u32) -> bool {
+    stop_refresh_timer(hwnd);
+    unsafe { SetTimer(Some(hwnd), REFRESH_TICK, delay_ms.max(1), None) != 0 }
+}
+
+fn refresh_fence_now(g: &mut Global, idx: usize) {
+    let ghost = g.config.ghost_mode;
+    let vault = crate::config::vault_dir(&g.config);
+    let f = &mut g.fences[idx];
+    refresh_entries(f, &vault);
+    render_fence(&mut g.icons, ghost, f);
+}
 
 /// 页号收敛到合法范围,顶部行吸附到页首(尺寸/条目变化后调用)
 fn sync_page(f: &mut Fence) {
