@@ -31,6 +31,10 @@ fn default_icon() -> u32 {
     32
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for FenceCfg {
     fn default() -> Self {
         FenceCfg {
@@ -67,6 +71,15 @@ pub struct Config {
     pub autostart: bool,
     #[serde(default)]
     pub vault_dir: Option<PathBuf>,
+    /// 专用“下载收纳箱”的栅栏 id。程序只接管启动后新出现在桌面的文件。
+    #[serde(default)]
+    pub download_box_id: Option<u32>,
+    /// 是否接管程序运行后新出现在桌面的下载文件。
+    #[serde(default = "default_true")]
+    pub download_enabled: bool,
+    /// 下载接管开启时，是否显示专用收纳箱窗口。
+    #[serde(default = "default_true")]
+    pub download_box_visible: bool,
     /// 全局图标尺寸(逻辑像素,默认 32)
     #[serde(default = "default_icon")]
     pub icon: u32,
@@ -86,6 +99,9 @@ impl Default for Config {
             ghost_mode: false,
             autostart: false,
             vault_dir: None,
+            download_box_id: None,
+            download_enabled: true,
+            download_box_visible: true,
             icon: default_icon(),
             version: 3,
         }
@@ -170,6 +186,13 @@ mod dpi_tests {
         assert_eq!(scale_extent_for_dpi(260, 0, 192), 260);
         assert_eq!(scale_extent_for_dpi(520, 192, 144), 390);
     }
+
+    #[test]
+    fn legacy_config_keeps_download_capture_enabled_and_visible() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(c.download_enabled);
+        assert!(c.download_box_visible);
+    }
 }
 
 pub fn config_dir() -> PathBuf {
@@ -185,6 +208,10 @@ pub fn config_path() -> PathBuf {
 
 pub fn default_vault_dir() -> PathBuf {
     config_dir().join("vault")
+}
+
+pub fn download_box_dir() -> PathBuf {
+    config_dir().join("boxes").join("下载收纳箱")
 }
 
 pub fn vault_dir(c: &Config) -> PathBuf {
