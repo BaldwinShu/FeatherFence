@@ -43,19 +43,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, DrawIconEx, GetCursorPos, GetMessageW, GetWindowRect, GetSystemMetrics,
-    GetWindowTextW, IsDialogMessageW, IsWindow, KillTimer, LoadCursorW, PostMessageW, RegisterClassW,
-    SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenu, BS_DEFPUSHBUTTON,
-    BS_PUSHBUTTON, CS_DBLCLKS, ES_AUTOHSCROLL, HICON, HMENU, HTCLIENT, IDC_ARROW, IDC_SIZENESW,
-    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_SIZEALL, MF_CHECKED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MSG, SendMessageW, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW,
-    SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, DI_NORMAL, SC_MINIMIZE, SIZE_MINIMIZED,
-    TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage,
-    ULW_ALPHA, UpdateLayeredWindow, WINDOW_STYLE, WNDCLASSW, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFONT,
-    WM_SIZE, WM_SYSCOMMAND, WM_TIMER,
-    WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_EX_LAYERED,
+    GetWindowTextW, IsDialogMessageW, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW,
+    RegisterClassW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TrackPopupMenu, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_DBLCLKS,
+    ES_AUTOHSCROLL, GWL_HWNDPARENT, HICON, HMENU, HTCLIENT, IDC_ARROW, IDC_SIZENESW, IDC_SIZENS,
+    IDC_SIZENWSE, IDC_SIZEWE, IDC_SIZEALL, MF_CHECKED, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, MSG, SC_MINIMIZE, SET_WINDOW_POS_FLAGS, SIZE_MINIMIZED, SM_CXDRAG, SM_CYDRAG,
+    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, SW_SHOWNA,
+    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, DI_NORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage,
+    ULW_ALPHA, UpdateLayeredWindow, WINDOWPOS, WINDOW_STYLE, WNDCLASSW, WM_APP,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFONT, WM_SHOWWINDOW, WM_SIZE, WM_SYSCOMMAND,
+    WM_TIMER, WM_WINDOWPOSCHANGING,
+    WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -108,6 +109,16 @@ fn margin(d: f32) -> i32 {
 /// 页面圆点轨道宽度:图标网格让出右侧竖条,圆点不压到图标上
 fn rail(d: f32) -> i32 {
     (22.0 * d) as i32
+}
+
+/// 最小化按钮宽度(物理像素)
+fn btn_w(d: f32) -> i32 {
+    (28.0 * d) as i32
+}
+
+/// 最小化按钮边距(物理像素)
+fn btn_margin(_d: f32) -> i32 {
+    6
 }
 /// 全局图标尺寸(逻辑像素):所有栅栏统一
 static ICON_PX: AtomicU32 = AtomicU32::new(32);
@@ -293,10 +304,15 @@ pub struct Fence {
     /// 已渲染 DIB 缓存:ULW 整幅提交的源(内容不保留,必须自己存)
     pub cache: Option<RenderCache>,
     pub valid: bool,
+    /// 是否最小化(紧凑视图:仅显示首个条目)
+    pub minimized: bool,
+    /// 最小化按钮 hover 状态
+    pub minimize_hover: bool,
 }
 
 impl Fence {
     pub fn new(cfg: FenceCfg, hwnd: HWND) -> Self {
+        let minimized = cfg.minimized;
         Fence {
             cfg,
             hwnd,
@@ -319,6 +335,8 @@ impl Fence {
             refresh_signal: RefreshSignal::default(),
             cache: None,
             valid: true,
+            minimized,
+            minimize_hover: false,
         }
     }
 }
@@ -462,6 +480,12 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             let _ = ShowWindow(hwnd, SW_SHOWNA);
             // 圆角由 DWM 裁
             enable_round(hwnd);
+            // 挂桌面宿主(Progman/WorkerW)为窗口所有者:Show Desktop 不会隐藏桌面层窗口
+            if let Some(host) = crate::utils::find_desktop_host() {
+                unsafe { SetWindowLongPtrW(hwnd, GWL_HWNDPARENT, host.0 as isize); }
+            }
+            // 可见性看门狗:每 500ms 检查窗口是否被 Show Desktop 隐藏
+            unsafe { let _ = SetTimer(Some(hwnd), VIS_TICK, 500, None); }
             // 首帧渲染(画进缓存 + ULW 提交)
             schedule_render(hwnd);
             // 自检:程序自己测命中(对比外部诊断,区分桌面/进程视角问题)
@@ -1073,6 +1097,22 @@ unsafe extern "system" fn fence_wndproc(
                     {
                         let f = &mut g.fences[idx];
                         let d = f.dpi;
+
+                        // 最小化按钮 hover 追踪
+                        let new_min_hover = hit_minimize_btn(f, x, y);
+                        if new_min_hover != f.minimize_hover {
+                            f.minimize_hover = new_min_hover;
+                            need_render = true;
+                        }
+
+                        // 最小化态跳过所有拖拽/缩放/翻页/拖出/hover
+                        if f.minimized {
+                            if need_render {
+                                render_fence(&mut g.icons, ghost, &mut g.fences[idx]);
+                            }
+                            return;
+                        }
+
                         if ghost && !f.hover_visible {
                             f.hover_visible = true;
                             let mut tme = TRACKMOUSEEVENT {
@@ -1214,6 +1254,17 @@ unsafe extern "system" fn fence_wndproc(
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let ghost = g.config.ghost_mode;
                     let f = &mut g.fences[idx];
+                    // 最小化态:点击任意位置恢复;非最小化态:优先判断最小化按钮
+                    if f.minimized {
+                        toggle_minimize(f);
+                        render_fence(&mut g.icons, g.config.ghost_mode, f);
+                        return;
+                    }
+                    if hit_minimize_btn(f, x, y) {
+                        toggle_minimize(f);
+                        render_fence(&mut g.icons, g.config.ghost_mode, f);
+                        return;
+                    }
                     if y < title_h(f.dpi) {
                         f.moving = true;
                         let mut cur = POINT::default();
@@ -1265,6 +1316,16 @@ unsafe extern "system" fn fence_wndproc(
         WM_LBUTTONDBLCLK => {
             let x = low16(lparam.0 as usize);
             let y = high16(lparam.0 as usize);
+            // 最小化态双击:先恢复再响应
+            with_global(|g| {
+                if let Some(idx) = fence_idx(g, hwnd) {
+                    if g.fences[idx].minimized {
+                        toggle_minimize(&mut g.fences[idx]);
+                        render_fence(&mut g.icons, g.config.ghost_mode, &mut g.fences[idx]);
+                        return;
+                    }
+                }
+            });
             if y < title_h(window_dpi(hwnd)) {
                 // 双击顶部栅栏名 → 重命名
                 rename_fence(hwnd);
@@ -1306,6 +1367,10 @@ unsafe extern "system" fn fence_wndproc(
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let ghost = g.config.ghost_mode;
                     let f = &mut g.fences[idx];
+                    // 最小化态不翻页
+                    if f.minimized {
+                        return;
+                    }
                     // 增量先累加,满 120(一次滚轮刻度)翻一页;触控板小增量累积后同样翻页
                     f.wheel_acc += raw;
                     let steps = f.wheel_acc / 120;
@@ -1356,6 +1421,14 @@ unsafe extern "system" fn fence_wndproc(
                         render_fence(&mut g.icons, g.config.ghost_mode, f);
                     }
                 });
+            } else if wparam.0 == VIS_TICK {
+                // Show Desktop 兜底:每 500ms 检查窗口是否被隐藏,被藏就恢复
+                if !IsWindow(Some(hwnd)).as_bool() {
+                    return LRESULT(0);
+                }
+                if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() } {
+                    unsafe { let _ = ShowWindow(hwnd, SW_SHOWNA); }
+                }
             }
             return LRESULT(0);
         }
@@ -1366,6 +1439,7 @@ unsafe extern "system" fn fence_wndproc(
                     let f = &mut g.fences[idx];
                     f.hover_visible = false;
                     f.hover = None;
+                    f.minimize_hover = false;
                     render_fence(&mut g.icons, ghost, f);
                 }
             });
@@ -1375,11 +1449,20 @@ unsafe extern "system" fn fence_wndproc(
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let f = &g.fences[idx];
+                    // 最小化态不显示 resize/move 光标
+                    if f.minimized {
+                        let hc = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+                        SetCursor(Some(hc));
+                        return;
+                    }
                     let mut pt = POINT::default();
                     GetCursorPos(&mut pt);
                     let mut cpt = pt;
                     windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut cpt);
-                    let cursor = if cpt.y < title_h(f.dpi) {
+                    // 最小化按钮区域优先显示箭头
+                    let cursor = if hit_minimize_btn(f, cpt.x, cpt.y) {
+                        IDC_ARROW
+                    } else if cpt.y < title_h(f.dpi) {
                         IDC_SIZEALL
                     } else if let Some(d) = resize_dir_at(f, cpt.x, cpt.y) {
                         match d {
@@ -1417,6 +1500,12 @@ unsafe extern "system" fn fence_wndproc(
                     f.cfg.w = nw;
                     f.cfg.h = nh;
                     f.cfg.dpi = newdpi;
+                    // DPI 变化时同步恢复尺寸(缩放比例换算)
+                    if !f.minimized && f.cfg.restore_w > 0 {
+                        let old_dpi = f.cfg.dpi.saturating_sub(newdpi.saturating_sub(f.cfg.dpi).max(0));
+                        f.cfg.restore_w = crate::config::scale_extent_for_dpi(f.cfg.restore_w, old_dpi.max(96), newdpi);
+                        f.cfg.restore_h = crate::config::scale_extent_for_dpi(f.cfg.restore_h, old_dpi.max(96), newdpi);
+                    }
                     unsafe {
                         let _ = SetWindowPos(
                             hwnd,
@@ -1474,9 +1563,85 @@ unsafe extern "system" fn fence_wndproc(
             });
             return LRESULT(0);
         }
+        WM_SHOWWINDOW => {
+            // Show Desktop 通过 WM_SHOWWINDOW(wparam=FALSE) 通知窗口隐藏。
+            // 拦截:羽栅栏属于桌面层,不应被隐藏。
+            if wparam.0 == 0 {
+                return LRESULT(0);
+            }
+        }
+        WM_SYSCOMMAND => {
+            // Show Desktop 可能通过 SC_MINIMIZE 最小化窗口
+            if (wparam.0 & 0xFFF0) == 0xF020usize {
+                return LRESULT(0);
+            }
+        }
+        WM_WINDOWPOSCHANGING => {
+            // Show Desktop 通过 SWP_HIDEWINDOW 标志隐藏所有顶层窗口
+            let wp = lparam.0 as *mut WINDOWPOS;
+            if !wp.is_null() {
+                unsafe {
+                    let pos = &mut *wp;
+                    if (pos.flags.0 & SWP_HIDEWINDOW_MASK.0) != 0 {
+                        pos.flags = SET_WINDOW_POS_FLAGS(pos.flags.0 & !SWP_HIDEWINDOW_MASK.0);
+                    }
+                }
+            }
+            return LRESULT(0);
+        }
         _ => {}
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 命中测试:鼠标是否落在最小化按钮上
+fn hit_minimize_btn(f: &Fence, x: i32, y: i32) -> bool {
+    let bw = btn_w(f.dpi);
+    y < title_h(f.dpi) && x >= f.cfg.w - bw && x < f.cfg.w
+}
+
+/// 紧凑视图尺寸(只显示第一个图标的最小窗口)
+fn compact_size(f: &Fence) -> (i32, i32) {
+    let d = f.dpi;
+    let cw = cell_w(f) + 2 * margin(d);
+    let ch = title_h(d) + cell_h(f) + 2 * margin(d);
+    (cw, ch)
+}
+
+/// 切换栅栏最小化/恢复状态
+pub fn toggle_minimize(f: &mut Fence) {
+    if f.minimized {
+        // 恢复
+        let rw = if f.cfg.restore_w > 0 { f.cfg.restore_w } else { f.cfg.w };
+        let rh = if f.cfg.restore_h > 0 { f.cfg.restore_h } else { f.cfg.h };
+        let rw = rw.max(min_w(f.dpi));
+        let rh = rh.max(min_h(f.dpi));
+        f.cfg.w = rw;
+        f.cfg.h = rh;
+        f.minimized = false;
+        unsafe {
+            let _ = SetWindowPos(f.hwnd, None, f.cfg.x, f.cfg.y, rw, rh,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    } else {
+        // 最小化:保存当前尺寸
+        f.cfg.restore_w = f.cfg.w;
+        f.cfg.restore_h = f.cfg.h;
+        let (cw, ch) = compact_size(f);
+        f.cfg.w = cw;
+        f.cfg.h = ch;
+        f.minimized = true;
+        unsafe {
+            let _ = SetWindowPos(f.hwnd, None, 0, 0, cw, ch,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    f.hover = None;
+    f.wheel_acc = 0;
+    f.drag_idx = None;
+    f.moving = false;
+    f.resizing = None;
+    sync_page(f);
 }
 
 fn grid_dims(f: &Fence) -> (i32, i32) {
@@ -1528,6 +1693,15 @@ fn refresh_fence_now(g: &mut Global, idx: usize) {
     refresh_entries(f, &vault);
     render_fence(&mut g.icons, ghost, f);
 }
+
+/// 可见性看门狗定时器 ID(每 500ms 检查窗口是否被 Show Desktop 隐藏)
+const VIS_TICK: usize = 0xFE11;
+
+/// SWP_NOMOVE: 保持当前位置(x,y 参数被忽略)
+const SWP_NOMOVE: SET_WINDOW_POS_FLAGS = SET_WINDOW_POS_FLAGS(2u32);
+
+/// SWP_HIDEWINDOW: 0x80 标志,Show Desktop 会通过 WINDOWPOSCHANGING 发送此标志
+const SWP_HIDEWINDOW_MASK: SET_WINDOW_POS_FLAGS = SET_WINDOW_POS_FLAGS(0x80u32);
 
 /// 页号收敛到合法范围,顶部行吸附到页首(尺寸/条目变化后调用)
 fn sync_page(f: &mut Fence) {
@@ -1656,6 +1830,10 @@ fn overlaps_any(g: &crate::Global, self_idx: usize, x: i32, y: i32, w: i32, h: i
 /// 用于拖动/缩放松手、创建、启动恢复、图标大小变更后。
 pub fn settle_fence(g: &mut crate::Global, idx: usize) {
     if idx >= g.fences.len() {
+        return;
+    }
+    // 最小化态不参与网格落位
+    if g.fences[idx].minimized {
         return;
     }
     let hwnd = g.fences[idx].hwnd;
@@ -2013,11 +2191,11 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
         let mut title_brush: *mut GpSolidFill = std::ptr::null_mut();
         GdipCreateSolidFill(0xFFFFFFFF, &mut title_brush);
 
-        // 居中:横向铺满内容区(右侧留出页面圆点轨道),StringAlignmentCenter 使文字居中
+        // 居中:横向铺满内容区(右侧留出最小化按钮空间),StringAlignmentCenter 使文字居中
         let title_rect = RectF {
             X: 0.0,
             Y: 0.0,
-            Width: (w - rail(d)).max(1) as f32,
+            Width: (w - btn_w(d)).max(1) as f32,
             Height: title_h(d) as f32,
         };
         let display_title = if f.cfg.folder.is_some() && f.cfg.title.is_empty() {
@@ -2031,6 +2209,40 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
             f.cfg.title.clone()
         };
         draw_text(gfx, font, fmt, title_brush as *const GpBrush, &display_title, title_rect);
+
+        // 最小化按钮(标题栏右侧)
+        {
+            let mut btn_font: *mut GpFont = std::ptr::null_mut();
+            GdipCreateFont(fam, font_title(d) * 0.85f32, FontStyleRegular.0, UnitPixel, &mut btn_font);
+            let mut btn_fmt: *mut GpStringFormat = std::ptr::null_mut();
+            GdipCreateStringFormat(0, 0, &mut btn_fmt);
+            GdipSetStringFormatAlign(btn_fmt, StringAlignmentCenter);
+            GdipSetStringFormatLineAlign(btn_fmt, StringAlignmentCenter);
+            // hover 时按钮背景高亮
+            if f.minimize_hover {
+                let mut hover_brush: *mut GpSolidFill = std::ptr::null_mut();
+                GdipCreateSolidFill(0x33FFFFFF, &mut hover_brush);
+                let hover_y = 2.0 * d;
+                let hover_h = (title_h(d) as f32 - 4.0 * d).max(1.0);
+                GdipFillRectangle(gfx, hover_brush as *mut GpBrush,
+                    (w - btn_w(d)).max(0) as f32, hover_y, btn_w(d) as f32, hover_h);
+                GdipDeleteBrush(hover_brush as *mut GpBrush);
+            }
+            let mut btn_brush: *mut GpSolidFill = std::ptr::null_mut();
+            let btn_color = if f.minimize_hover { 0xFFFFFFFFu32 } else { 0xBBFFFFFFu32 };
+            GdipCreateSolidFill(btn_color, &mut btn_brush);
+            let btn_label = if f.minimized { "\u{25A1}" } else { "\u{2014}" };
+            let btn_rect = RectF {
+                X: (w - btn_w(d)).max(0) as f32,
+                Y: 0.0,
+                Width: btn_w(d) as f32,
+                Height: title_h(d) as f32,
+            };
+            draw_text(gfx, btn_font, btn_fmt, btn_brush as *const GpBrush, btn_label, btn_rect);
+            GdipDeleteBrush(btn_brush as *mut GpBrush);
+            GdipDeleteStringFormat(btn_fmt);
+            GdipDeleteFont(btn_font);
+        }
 
         // 图标网格
         // 待画的图标(位置 + HICON):GDI DrawIconEx 在 GDI+ 绘制完成后统一直绘。
@@ -2136,8 +2348,10 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                     }
                 }
                 GdipResetClip(gfx);
-                // 侧边页面指示点:当前页微放大 + 高亮(随滚动位置连续过渡)
-                draw_page_dots(gfx, f, w, h);
+                // 侧边页面指示点(最小化态不显示)
+                if !f.minimized {
+                    draw_page_dots(gfx, f, w, h);
+                }
                 GdipDeleteBrush(hover_brush as *mut GpBrush);
                 GdipDeleteFont(label_font);
                 GdipDeleteStringFormat(label_fmt);

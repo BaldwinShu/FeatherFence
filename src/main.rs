@@ -353,6 +353,9 @@ fn ensure_download_box(g: &mut Global) {
         dpi: (96.0 * s).round() as u32,
         opacity: 0.74,
         icon: 32,
+        minimized: false,
+        restore_w: 0,
+        restore_h: 0,
     };
     let id = create_fence(g, cfg);
     if id != 0 {
@@ -849,6 +852,9 @@ fn dispatch_menu(cmd: u32) {
                         dpi: (96.0 * s).round() as u32,
                         opacity: 0.74,
                         icon: 32,
+                        minimized: false,
+                        restore_w: 0,
+                        restore_h: 0,
                     };
                     create_fence(g, cfg);
                 }
@@ -893,6 +899,9 @@ fn dispatch_menu(cmd: u32) {
                         dpi: (96.0 * s).round() as u32,
                         opacity: 0.74,
                         icon: 32,
+                        minimized: false,
+                        restore_w: 0,
+                        restore_h: 0,
                     };
                     create_fence(g, cfg);
                 }
@@ -1174,6 +1183,30 @@ fn main() {
         }
         // 始终保留专用下载收纳箱；是否接管/显示由两个独立配置控制。
         ensure_download_box(g);
+        // 首启:没有栅栏就建一个默认收纳箱(右侧),并保存配置
+        if g.fences.is_empty() {
+            let (sw, _sh) = utils::screen_size();
+            let s = fence::dpi_scale();
+            let box_cfg = FenceCfg {
+                id: g.next_id,
+                title: "收纳箱".into(),
+                folder: None,
+                x: sw - (320.0 * s) as i32,
+                y: (100.0 * s) as i32,
+                w: (260.0 * s) as i32,
+                h: (340.0 * s) as i32,
+                dpi: (96.0 * s).round() as u32,
+                opacity: 0.74,
+                icon: 32,
+                minimized: false,
+                restore_w: 0,
+                restore_h: 0,
+            };
+            // 创建成功才保存,避免失败时把配置覆盖成空
+            if create_fence(g, box_cfg) != 0 {
+                sync_config(g);
+            }
+        }
         // 网格落位:恢复后把所有栅栏吸附到整数槽位、clamp 进工作区,
         // 并推挤消除重叠 —— 重启后布局也保持规整
         let n = g.fences.len();
