@@ -308,6 +308,8 @@ pub struct Fence {
     pub minimized: bool,
     /// 最小化按钮 hover 状态
     pub minimize_hover: bool,
+    /// 用户主动隐藏(托盘菜单/Zen 模式):允许 WM_SHOWWINDOW 隐藏,系统级 Show Desktop 仍被拦截
+    pub user_hidden: bool,
 }
 
 impl Fence {
@@ -337,6 +339,7 @@ impl Fence {
             valid: true,
             minimized,
             minimize_hover: false,
+            user_hidden: false,
         }
     }
 }
@@ -1422,11 +1425,20 @@ unsafe extern "system" fn fence_wndproc(
                     }
                 });
             } else if wparam.0 == VIS_TICK {
-                // Show Desktop 兜底:每 500ms 检查窗口是否被隐藏,被藏就恢复
+                // Show Desktop 兜底:每 500ms 检查窗口是否被系统隐藏,被藏就恢复
+                // 用户主动隐藏(托盘菜单/Zen 模式)时跳过,避免干扰"隐藏/显示全部栅栏"
                 if !IsWindow(Some(hwnd)).as_bool() {
                     return LRESULT(0);
                 }
-                if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() } {
+                let should_force_show = with_global(|g| {
+                    if let Some(idx) = fence_idx(g, hwnd) {
+                        let f = &g.fences[idx];
+                        !g.zen && !f.user_hidden
+                    } else {
+                        false
+                    }
+                });
+                if should_force_show && !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() } {
                     unsafe { let _ = ShowWindow(hwnd, SW_SHOWNA); }
                 }
             }
@@ -1565,8 +1577,20 @@ unsafe extern "system" fn fence_wndproc(
         }
         WM_SHOWWINDOW => {
             // Show Desktop 通过 WM_SHOWWINDOW(wparam=FALSE) 通知窗口隐藏。
-            // 拦截:羽栅栏属于桌面层,不应被隐藏。
-            if wparam.0 == 0 {
+            // 用户主动隐藏(托盘菜单/Zen 模式)时允许隐藏,否则拦截系统级隐藏。
+            let allow = with_global(|g| {
+                if let Some(idx) = fence_idx(g, hwnd) {
+                    let f = &g.fences[idx];
+                    if wparam.0 == 0 {
+                        f.user_hidden // 用户主动隐藏:允许
+                    } else {
+                        !f.user_hidden // 系统/程序要显示:仅当用户没主动隐藏时才允许
+                    }
+                } else {
+                    false
+                }
+            });
+            if !allow {
                 return LRESULT(0);
             }
         }
@@ -1577,17 +1601,29 @@ unsafe extern "system" fn fence_wndproc(
             }
         }
         WM_WINDOWPOSCHANGING => {
-            // Show Desktop 通过 SWP_HIDEWINDOW 标志隐藏所有顶层窗口
-            let wp = lparam.0 as *mut WINDOWPOS;
-            if !wp.is_null() {
-                unsafe {
-                    let pos = &mut *wp;
-                    if (pos.flags.0 & SWP_HIDEWINDOW_MASK.0) != 0 {
-                        pos.flags = SET_WINDOW_POS_FLAGS(pos.flags.0 & !SWP_HIDEWINDOW_MASK.0);
+            // Show Desktop 通过 SWP_HIDEWINDOW 标志隐藏所有顶层窗口。
+            // 仅拦截系统级隐藏;用户主动隐藏(托盘菜单/Zen 模式,user_hidden=true)时
+            // 保留该标志,让 ShowWindow(SW_HIDE) 真正生效。
+            let user_hidden = with_global(|g| {
+                if let Some(idx) = fence_idx(g, hwnd) {
+                    g.fences[idx].user_hidden
+                } else {
+                    false
+                }
+            });
+            if !user_hidden {
+                let wp = lparam.0 as *mut WINDOWPOS;
+                if !wp.is_null() {
+                    unsafe {
+                        let pos = &mut *wp;
+                        if (pos.flags.0 & SWP_HIDEWINDOW_MASK.0) != 0 {
+                            pos.flags = SET_WINDOW_POS_FLAGS(pos.flags.0 & !SWP_HIDEWINDOW_MASK.0);
+                        }
                     }
                 }
+                return LRESULT(0);
             }
-            return LRESULT(0);
+            // 用户主动隐藏:不拦截,走 DefWindowProc 让隐藏生效
         }
         _ => {}
     }

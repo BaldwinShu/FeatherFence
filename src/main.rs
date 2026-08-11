@@ -416,14 +416,23 @@ fn sync_config(g: &mut Global) {
 }
 
 fn apply_visibility(g: &mut Global) {
-    for f in &g.fences {
+    let zen = g.zen;
+    // 预先计算每个栅栏是否应显示,避免在 &mut 迭代中借用 &g
+    let show: Vec<bool> = g
+        .fences
+        .iter()
+        .map(|f| !zen && download_box_should_show(g, f.cfg.id))
+        .collect();
+    for (f, &should_show) in g.fences.iter_mut().zip(show.iter()) {
         if !f.valid {
             continue;
         }
         unsafe {
-            if g.zen || !download_box_should_show(g, f.cfg.id) {
+            if !should_show {
+                f.user_hidden = true; // 标记用户主动隐藏,允许 WM_SHOWWINDOW 隐藏
                 ShowWindow(f.hwnd, SW_HIDE);
             } else {
+                f.user_hidden = false; // 取消主动隐藏标记,允许显示
                 ShowWindow(f.hwnd, SW_SHOWNA);
             }
         }
@@ -479,6 +488,7 @@ fn watchdog_tick(g: &mut Global) {
                 f.moving = false;
                 f.resizing = None;
                 if g.zen {
+                    f.user_hidden = true;
                     unsafe { ShowWindow(hwnd, SW_HIDE); }
                 }
                 fence::refresh_entries(f, &config::vault_dir(&g.config));
