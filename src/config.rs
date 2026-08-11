@@ -21,6 +21,15 @@ pub struct FenceCfg {
     /// 图标尺寸(旧版存于栅栏上;现由 Config.icon 全局统一。保留字段仅用于一次性迁移)
     #[serde(default = "default_icon")]
     pub icon: u32,
+    /// 最小化(紧凑视图:仅显示首个条目)
+    #[serde(default)]
+    pub minimized: bool,
+    /// 最小化前保存的恢复宽度
+    #[serde(default)]
+    pub restore_w: i32,
+    /// 最小化前保存的恢复高度
+    #[serde(default)]
+    pub restore_h: i32,
 }
 
 fn default_opacity() -> f32 {
@@ -44,6 +53,9 @@ impl Default for FenceCfg {
             dpi: 96,
             opacity: default_opacity(),
             icon: default_icon(),
+            minimized: false,
+            restore_w: 0,
+            restore_h: 0,
         }
     }
 }

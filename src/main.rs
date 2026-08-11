@@ -541,6 +541,9 @@ fn dispatch_menu(cmd: u32) {
                         dpi: (96.0 * s).round() as u32,
                         opacity: 0.74,
                         icon: 32,
+                        minimized: false,
+                        restore_w: 0,
+                        restore_h: 0,
                     };
                     create_fence(g, cfg);
                 }
@@ -585,6 +588,9 @@ fn dispatch_menu(cmd: u32) {
                         dpi: (96.0 * s).round() as u32,
                         opacity: 0.74,
                         icon: 32,
+                        minimized: false,
+                        restore_w: 0,
+                        restore_h: 0,
                     };
                     create_fence(g, cfg);
                 }
@@ -840,6 +846,9 @@ fn main() {
                 dpi: (96.0 * s).round() as u32,
                 opacity: 0.74,
                 icon: 32,
+                minimized: false,
+                restore_w: 0,
+                restore_h: 0,
             };
             // 创建成功才保存,避免失败时把配置覆盖成空
             if create_fence(g, box_cfg) != 0 {
