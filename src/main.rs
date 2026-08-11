@@ -77,7 +77,34 @@ pub struct Global {
     /// 拖放 COM 对象,保持存活
     pub droptargets: Vec<windows::Win32::System::Ole::IDropTarget>,
     /// 目录监听线程
-    pub watchers: Vec<watcher::DirWatcher>,
+    pub watchers: Vec<ManagedWatcher>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WatcherOwner {
+    Process,
+    Fence(u32),
+}
+
+pub struct ManagedWatcher {
+    owner: WatcherOwner,
+    _watcher: watcher::DirWatcher,
+}
+
+impl ManagedWatcher {
+    fn process(watcher: watcher::DirWatcher) -> Self {
+        Self {
+            owner: WatcherOwner::Process,
+            _watcher: watcher,
+        }
+    }
+
+    fn fence(id: u32, watcher: watcher::DirWatcher) -> Self {
+        Self {
+            owner: WatcherOwner::Fence(id),
+            _watcher: watcher,
+        }
+    }
 }
 
 pub struct DownloadCandidate {
@@ -273,7 +300,7 @@ pub fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
                 );
             }
         });
-        g.watchers.push(watcher);
+        g.watchers.push(ManagedWatcher::fence(id, watcher));
     }
     sync_config(g);
     id
@@ -283,12 +310,15 @@ pub fn delete_fence(g: &mut Global, idx: usize) {
     if idx >= g.fences.len() {
         return;
     }
-    let f = &g.fences[idx];
+    // 先从全局状态移除，DestroyWindow 同步派发 WM_DESTROY 时就不会把条目标成
+    // “意外失效”并被 watchdog 重建。对应监听器在窗口销毁前停止，避免继续投递刷新。
+    let f = g.fences.remove(idx);
+    g.watchers
+        .retain(|watcher| watcher.owner != WatcherOwner::Fence(f.cfg.id));
     unsafe {
         windows::Win32::System::Ole::RevokeDragDrop(f.hwnd);
         DestroyWindow(f.hwnd);
     }
-    g.fences.remove(idx);
     sync_config(g);
 }
 
@@ -923,6 +953,10 @@ fn dispatch_menu(cmd: u32) {
                 let mut c = config::load();
                 config::normalize_dpi(&mut c);
                 g.config = c;
+                // 保留进程级监听（桌面清扫和 Downloads 接管）；先停止所有栅栏监听，
+                // 避免窗口销毁期间仍收到刷新。
+                g.watchers
+                    .retain(|watcher| watcher.owner == WatcherOwner::Process);
                 // 先销毁全部旧窗口(避免持借用调用 DestroyWindow)
                 let hwnds: Vec<HWND> = g.fences.iter().filter(|f| f.valid).map(|f| f.hwnd).collect();
                 for h in hwnds {
@@ -933,7 +967,6 @@ fn dispatch_menu(cmd: u32) {
                 }
                 g.fences.clear();
                 g.droptargets.clear();
-                g.watchers.clear();
                 for cfg in g.config.fences.clone() {
                     create_fence(g, cfg);
                 }
@@ -1173,7 +1206,7 @@ fn main() {
                     }
                 }
             });
-            g.watchers.push(watcher);
+            g.watchers.push(ManagedWatcher::process(watcher));
         }
         // 下载收纳箱：单独监听 Downloads 目录，避免把桌面所有文件都当下载。
         if let Some(dir) = downloads_dir() {
@@ -1181,7 +1214,7 @@ fn main() {
             let watcher = watcher::spawn_dir_watcher(dir, move |names| {
                 let _ = tx.send(names.clone());
             });
-            g.watchers.push(watcher);
+            g.watchers.push(ManagedWatcher::process(watcher));
         }
         reserve_desktop_icons(g);
     });
@@ -1220,6 +1253,8 @@ fn main() {
     // 清理
     with_global(|g| {
         g.exiting = true;
+        // 先停止所有目录监听，确保清理窗口和 COM/GDI+ 后不再有后台通知。
+        g.watchers.clear();
         config::save(&g.config);
         for f in g.fences.iter() {
             if f.valid {

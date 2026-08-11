@@ -509,24 +509,13 @@ pub fn fence_menu(hwnd: HWND) {
         let cmd = cmd.0 as u32;
         if cmd == 1001 {
             with_global(|g| {
-                // 先按 hwnd 移除再销毁:DestroyWindow 会同步发 WM_DESTROY 把该栅栏
-                // valid 置 false,若之后才 remove(watchdog 把 !valid 当"被 Explorer 销毁"
-                // 重建回来),列表条目删不掉,watchdog 定时器几秒后就会把栅栏重建回来
-                // = "删除无效"。先移除,WM_DESTROY 里 fence_idx 自然找不到,无副作用。
                 if let Some(idx) = g.fences.iter().position(|f| f.hwnd == hwnd) {
                     if g.config.download_box_id == Some(g.fences[idx].cfg.id) {
                         crate::set_download_enabled(g, false);
                         return;
                     }
-                    let h = g.fences[idx].hwnd;
-                    g.fences.remove(idx);
-                    unsafe {
-                        windows::Win32::System::Ole::RevokeDragDrop(h);
-                        DestroyWindow(h);
-                    }
+                    crate::delete_fence(g, idx);
                 }
-                g.config.fences = config_snapshot(&g.fences);
-                crate::config::save(&g.config);
             });
         } else if (1002..=1004).contains(&cmd) {
             with_global(|g| {
