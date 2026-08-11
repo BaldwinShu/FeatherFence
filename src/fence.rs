@@ -1600,10 +1600,11 @@ fn hit_minimize_btn(f: &Fence, x: i32, y: i32) -> bool {
     y < title_h(f.dpi) && x >= f.cfg.w - bw && x < f.cfg.w
 }
 
-/// 紧凑视图尺寸(只显示第一个图标的最小窗口)
+/// 紧凑视图尺寸(单行 3 列图标,无翻页圆点轨道)
 fn compact_size(f: &Fence) -> (i32, i32) {
     let d = f.dpi;
-    let cw = cell_w(f) + 2 * margin(d);
+    let cols = (f.entries.len().max(1) as i32).min(3);
+    let cw = (cols * cell_w(f) + 2 * margin(d)).max(min_w(d));
     let ch = title_h(d) + cell_h(f) + 2 * margin(d);
     (cw, ch)
 }
@@ -1648,8 +1649,9 @@ fn grid_dims(f: &Fence) -> (i32, i32) {
     let w = f.cfg.w;
     let h = f.cfg.h;
     let d = f.dpi;
-    // 宽度让出右侧圆点轨道
-    let cols = ((w - 2 * margin(d) - rail(d)) / cell_w(f)).max(1);
+    // 最小化态无翻页圆点,不预留轨道;正常态让出右侧圆点轨道
+    let rail = if f.minimized { 0 } else { rail(d) };
+    let cols = ((w - 2 * margin(d) - rail) / cell_w(f)).max(1);
     let rows = ((h - title_h(d) - 2 * margin(d)) / cell_h(f)).max(0);
     (cols, rows)
 }
@@ -2256,7 +2258,8 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
             let (cols, rows) = grid_dims(f);
             grid_rows = rows;
             if rows > 0 {
-                let cell_w = (w - 2 * margin(d) - rail(d)) as f32 / cols.max(1) as f32;
+                let rail_offset = if f.minimized { 0 } else { rail(d) };
+                let cell_w = (w - 2 * margin(d) - rail_offset) as f32 / cols.max(1) as f32;
                 let mut hover_brush: *mut GpSolidFill = std::ptr::null_mut();
                 GdipCreateSolidFill(0x22FFFFFF, &mut hover_brush);
                 let mut label_font: *mut GpFont = std::ptr::null_mut();
