@@ -24,7 +24,7 @@ pub struct FenceCfg {
 }
 
 fn default_opacity() -> f32 {
-    0.74
+    0.7
 }
 
 fn default_icon() -> u32 {
