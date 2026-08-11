@@ -39,7 +39,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, GetWindow, GetWindowRect, HWND_MESSAGE, HWND_TOP, IsIconic, IsWindow,
+    GetMessageW, GetWindow, GetWindowRect, HWND_TOP, IsIconic, IsWindow,
     IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SetParent, SetWindowPos,
     ShowWindow, GW_HWNDPREV,
     TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW, WNDPROC,
@@ -1071,7 +1071,9 @@ fn main() {
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            // 托盘弹出菜单需要一个可成为前台窗口的隐藏顶层 owner；
+            // HWND_MESSAGE 消息窗口无法可靠触发“点击外部关闭菜单”。
+            None,
             None,
             Some(hinst),
             None,

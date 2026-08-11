@@ -2,15 +2,15 @@
 use std::mem::{size_of, zeroed};
 
 use windows::core::{w, BOOL, PCWSTR};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, HICON, ICONINFO,
-    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TrackPopupMenu, TPM_NONOTIFY,
-    TPM_RETURNCMD,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, PostMessageW,
+    SetForegroundWindow, HICON, ICONINFO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, TrackPopupMenu, TPM_NONOTIFY, TPM_RETURNCMD, WM_NULL,
 };
 use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
 
@@ -166,6 +166,10 @@ pub fn show_tray_menu(
 
         let mut pt = windows::Win32::Foundation::POINT::default();
         windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+
+        // 托盘菜单必须由一个前台顶层窗口拥有，否则 Windows 不会可靠地在用户
+        // 点击菜单外部时结束 TrackPopupMenu（菜单会一直留在屏幕上）。
+        let _ = SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_NONOTIFY,
@@ -175,6 +179,9 @@ pub fn show_tray_menu(
             hwnd,
             None,
         );
+        // 按照 Win32 托盘菜单约定，在 TrackPopupMenu 返回后投递一条消息，
+        // 确保系统完成菜单的关闭与前台切换。
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         DestroyMenu(menu);
         cmd.0 as u32
     }
