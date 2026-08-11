@@ -19,7 +19,7 @@ use std::ptr::NonNull;
 use std::mem::size_of;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{w, PCWSTR};
@@ -71,6 +71,7 @@ pub struct Global {
     /// 桌面监听线程传来的文件名；主线程等待写入稳定后移入下载收纳箱。
     pub desktop_rx: Receiver<Vec<String>>,
     pub desktop_seen: HashSet<PathBuf>,
+    pub download_rx: Receiver<Vec<String>>,
     pub download_pending: HashMap<PathBuf, DownloadCandidate>,
     pub exiting: bool,
     /// 拖放 COM 对象,保持存活
@@ -340,10 +341,15 @@ fn download_box_should_show(g: &Global, id: u32) -> bool {
     !is_download_box(g, id) || (g.config.download_enabled && g.config.download_box_visible)
 }
 
+fn downloads_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(|p| PathBuf::from(p).join("Downloads"))
+}
+
 fn reset_download_tracking(g: &mut Global) {
-    while g.desktop_rx.try_recv().is_ok() {}
+    while g.download_rx.try_recv().is_ok() {}
     g.download_pending.clear();
-    g.desktop_seen = desktop_dir()
+    g.desktop_seen = downloads_dir()
         .and_then(|d| std::fs::read_dir(d).ok())
         .into_iter()
         .flatten()
@@ -572,10 +578,10 @@ fn is_download_temp(path: &Path) -> bool {
 }
 
 fn ingest_desktop_events(g: &mut Global) {
-    let Some(desktop) = desktop_dir() else { return };
-    while let Ok(names) = g.desktop_rx.try_recv() {
+    let Some(downloads) = downloads_dir() else { return };
+    while let Ok(names) = g.download_rx.try_recv() {
         for name in names {
-            let path = desktop.join(name);
+            let path = downloads.join(name);
             if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case("desktop.ini")) {
                 continue;
             }
@@ -602,7 +608,7 @@ fn download_target(g: &Global) -> PathBuf {
 
 fn download_tick(g: &mut Global) {
     if !g.config.download_enabled {
-        while g.desktop_rx.try_recv().is_ok() {}
+        while g.download_rx.try_recv().is_ok() {}
         g.download_pending.clear();
         return;
     }
@@ -1060,7 +1066,8 @@ fn main() {
     let _ = std::fs::create_dir_all(&vault);
 
     let (desktop_tx, desktop_rx) = mpsc::channel::<Vec<String>>();
-    let desktop_seen = desktop_dir()
+    let (download_tx, download_rx) = mpsc::channel::<Vec<String>>();
+    let desktop_seen = downloads_dir()
         .and_then(|dir| std::fs::read_dir(dir).ok())
         .map(|rd| rd.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();
@@ -1076,6 +1083,7 @@ fn main() {
         sweep_retry: Vec::new(),
         desktop_rx,
         desktop_seen,
+        download_rx,
         download_pending: HashMap::new(),
         exiting: false,
         droptargets: Vec::new(),
@@ -1164,6 +1172,14 @@ fn main() {
                         break;
                     }
                 }
+            });
+            g.watchers.push(watcher);
+        }
+        // 下载收纳箱：单独监听 Downloads 目录，避免把桌面所有文件都当下载。
+        if let Some(dir) = downloads_dir() {
+            let tx = download_tx.clone();
+            let watcher = watcher::spawn_dir_watcher(dir, move |names| {
+                let _ = tx.send(names.clone());
             });
             g.watchers.push(watcher);
         }
