@@ -641,10 +641,41 @@ pub fn fence_menu(hwnd: HWND) {
         AppendMenuW(menu, MF_STRING, 1011, PCWSTR(w!("打开收纳箱").as_ptr()));
         AppendMenuW(menu, MF_STRING, 1005, PCWSTR(w!("重命名...").as_ptr()));
         AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        AppendMenuW(menu, MF_STRING, 1002, PCWSTR(w!("透明度 100%").as_ptr()));
-        AppendMenuW(menu, MF_STRING, 1003, PCWSTR(w!("透明度 70%").as_ptr()));
-        AppendMenuW(menu, MF_STRING, 1004, PCWSTR(w!("透明度 45%").as_ptr()));
-        AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let cur_opacity = with_global(|g| {
+            fence_idx(g, hwnd)
+                .map(|i| g.fences[i].cfg.opacity)
+                .unwrap_or_default()
+        });
+        let opacity_presets = [
+            (1002usize, 1.0f32, w!("100%")),
+            (1003, 0.7, w!("70%")),
+            (1004, 0.45, w!("45%")),
+            (1012, 0.3, w!("30%")),
+        ];
+        let selected_opacity_id = opacity_presets
+            .iter()
+            .min_by(|(_, a, _), (_, b, _)| {
+                (cur_opacity - *a)
+                    .abs()
+                    .total_cmp(&(cur_opacity - *b).abs())
+            })
+            .map(|(id, _, _)| *id)
+            .unwrap_or_default();
+        let opacity_menu = CreatePopupMenu().unwrap_or_default();
+        for (id, _, label) in opacity_presets {
+            let flags = if id == selected_opacity_id {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            AppendMenuW(opacity_menu, flags, id, PCWSTR(label.as_ptr()));
+        }
+        AppendMenuW(
+            menu,
+            MF_POPUP,
+            opacity_menu.0 as usize,
+            PCWSTR(w!("透明度").as_ptr()),
+        );
         // 图标大小子菜单(全局统一)
         let cur_icon = with_global(|g| g.config.icon.max(1));
         let icon_menu = CreatePopupMenu().unwrap_or_default();
@@ -681,14 +712,15 @@ pub fn fence_menu(hwnd: HWND) {
                     crate::delete_fence(g, idx);
                 }
             });
-        } else if (1002..=1004).contains(&cmd) {
+        } else if matches!(cmd, 1002..=1004 | 1012) {
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let ghost = g.config.ghost_mode;
                     g.fences[idx].cfg.opacity = match cmd {
                         1002 => 1.0,
                         1003 => 0.7,
-                        _ => 0.45,
+                        1004 => 0.45,
+                        _ => 0.3,
                     };
                     render_fence(&mut g.icons, ghost, &mut g.fences[idx]);
                     g.config.fences = config_snapshot(&g.fences);

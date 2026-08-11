@@ -351,7 +351,7 @@ fn ensure_download_box(g: &mut Global) {
         w: (260.0 * s) as i32,
         h: (340.0 * s) as i32,
         dpi: (96.0 * s).round() as u32,
-        opacity: 0.74,
+        opacity: 0.7,
         icon: 32,
     };
     let id = create_fence(g, cfg);
@@ -847,7 +847,7 @@ fn dispatch_menu(cmd: u32) {
                         w: (280.0 * s) as i32,
                         h: (340.0 * s) as i32,
                         dpi: (96.0 * s).round() as u32,
-                        opacity: 0.74,
+                        opacity: 0.7,
                         icon: 32,
                     };
                     create_fence(g, cfg);
@@ -891,7 +891,7 @@ fn dispatch_menu(cmd: u32) {
                         w: (260.0 * s) as i32,
                         h: (340.0 * s) as i32,
                         dpi: (96.0 * s).round() as u32,
-                        opacity: 0.74,
+                        opacity: 0.7,
                         icon: 32,
                     };
                     create_fence(g, cfg);
