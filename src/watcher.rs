@@ -1,7 +1,10 @@
 // 目录监听:ReadDirectoryChangesW,文件夹门户实时刷新 + 桌面自动归类
 use std::ffi::c_void;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HANDLE;
@@ -11,21 +14,92 @@ use windows::Win32::Storage::FileSystem::{
     FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+use windows::Win32::System::IO::CancelSynchronousIo;
 
 use crate::utils::wstr;
 
+#[derive(Default)]
+struct StopSignal {
+    stopped: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl StopSignal {
+    fn is_stopped(&self) -> bool {
+        *self
+            .stopped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn request_stop(&self) {
+        let mut stopped = self
+            .stopped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *stopped = true;
+        self.changed.notify_all();
+    }
+
+    /// 可中断的重试等待。返回 true 表示已请求停止。
+    fn wait_timeout(&self, timeout: Duration) -> bool {
+        let stopped = self
+            .stopped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *stopped {
+            return true;
+        }
+        let (stopped, _) = self
+            .changed
+            .wait_timeout_while(stopped, timeout, |stopped| !*stopped)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *stopped
+    }
+}
+
 pub struct DirWatcher {
-    pub thread: Option<JoinHandle<()>>,
+    stop: Arc<StopSignal>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl DirWatcher {
+    /// 停止阻塞中的 ReadDirectoryChangesW 并回收监听线程。可重复调用。
+    pub fn stop(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.stop.request_stop();
+
+        // CancelSynchronousIo 只取消调用瞬间已经挂起的同步 I/O。工作线程可能正好
+        // 位于“检查 stop → 发起 ReadDirectoryChangesW”的短窗口内，因此在它退出前
+        // 重试取消；线程每次 I/O 返回后也会检查 stop，不会再次进入阻塞读取。
+        while !thread.is_finished() {
+            unsafe {
+                let _ = CancelSynchronousIo(HANDLE(thread.as_raw_handle()));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = thread.join();
+    }
+}
+
+impl Drop for DirWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 pub fn spawn_dir_watcher<F>(dir: PathBuf, notify: F) -> DirWatcher
 where
     F: Fn(Vec<String>) + Send + 'static,
 {
+    let stop = Arc::new(StopSignal::default());
+    let thread_stop = stop.clone();
     let thread = std::thread::spawn(move || {
         let mut handle: Option<HANDLE> = None;
         let mut buf = vec![0u8; 64 * 1024];
-        loop {
+        while !thread_stop.is_stopped() {
             if handle.is_none() {
                 let wdir = wstr(&dir.to_string_lossy());
                 handle = unsafe {
@@ -41,9 +115,14 @@ where
                     .ok()
                 };
                 if handle.is_none() {
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    if thread_stop.wait_timeout(Duration::from_secs(3)) {
+                        break;
+                    }
                     continue;
                 }
+            }
+            if thread_stop.is_stopped() {
+                break;
             }
             let h = handle.unwrap();
             let mut returned: u32 = 0;
@@ -59,20 +138,33 @@ where
                     None,
                 )
             };
+            if thread_stop.is_stopped() {
+                break;
+            }
             if ok.is_err() || returned == 0 {
                 // 目录失效,关掉重来
                 unsafe { let _ = windows::Win32::Foundation::CloseHandle(h); }
                 handle = None;
-                std::thread::sleep(std::time::Duration::from_secs(3));
+                if thread_stop.wait_timeout(Duration::from_secs(3)) {
+                    break;
+                }
                 continue;
             }
             let names = parse_notify_names(&buf, returned as usize);
-            if !names.is_empty() {
+            if !names.is_empty() && !thread_stop.is_stopped() {
                 notify(names);
             }
         }
+        if let Some(handle) = handle {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
+        }
     });
-    DirWatcher { thread: Some(thread) }
+    DirWatcher {
+        stop,
+        thread: Some(thread),
+    }
 }
 
 fn parse_notify_names(buf: &[u8], returned: usize) -> Vec<String> {
@@ -120,6 +212,9 @@ fn parse_notify_names(buf: &[u8], returned: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::parse_notify_names;
+    use super::spawn_dir_watcher;
+    use std::sync::mpsc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use windows::Win32::Storage::FileSystem::FILE_ACTION_RENAMED_NEW_NAME;
 
     #[test]
@@ -133,6 +228,46 @@ mod tests {
             record.extend_from_slice(&ch.to_le_bytes());
         }
         assert_eq!(parse_notify_names(&record, record.len()), ["Notion-7.29.0.msix"]);
+    }
+
+    #[test]
+    fn stopped_watcher_does_not_deliver_later_changes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "feather-fences-watcher-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = spawn_dir_watcher(dir.clone(), move |names| {
+            let _ = tx.send(names);
+        });
+
+        // The worker opens the directory asynchronously. Probe until the first
+        // notification proves the watcher is ready instead of relying on sleep.
+        let mut ready = false;
+        for attempt in 0..30 {
+            let name = format!("probe-{attempt}.txt");
+            std::fs::write(dir.join(&name), b"probe").unwrap();
+            if let Ok(names) = rx.recv_timeout(Duration::from_millis(100)) {
+                if names.iter().any(|seen| seen == &name) {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        assert!(ready, "watcher did not report a change within 3 seconds");
+
+        watcher.stop();
+        while rx.try_recv().is_ok() {}
+        std::fs::write(dir.join("second.txt"), b"second").unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(250)).is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
