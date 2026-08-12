@@ -6,22 +6,23 @@
 use std::cell::Cell;
 use std::mem::size_of;
 
-use windows::core::{implement, BOOL, Error, HRESULT, Ref, Result};
+use windows::core::{implement, Error, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{
-    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_INVALIDARG, E_NOTIMPL,
-    E_UNEXPECTED, GlobalFree, HGLOBAL, POINT, S_FALSE, S_OK,
+    GlobalFree, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_INVALIDARG,
+    E_NOTIMPL, E_UNEXPECTED, HGLOBAL, POINT, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
-    DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC,
-    IEnumFORMATETC_Impl, IEnumSTATDATA, STGMEDIUM, TYMED_HGLOBAL,
+    IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA,
+    DVASPECT_CONTENT, FORMATETC, STGMEDIUM, TYMED_HGLOBAL,
 };
+use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GHND};
 use windows::Win32::System::Ole::{
-    CF_HDROP, DoDragDrop, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE,
-    IDropSource, IDropSource_Impl,
+    DoDragDrop, IDropSource, IDropSource_Impl, CF_HDROP, DROPEFFECT, DROPEFFECT_COPY,
+    DROPEFFECT_MOVE, DROPEFFECT_NONE,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
-use windows::Win32::UI::Shell::DROPFILES;
+use windows::Win32::UI::Shell::{CFSTR_PREFERREDDROPEFFECT, DROPFILES};
 
 /// DATA_E_FORMATETC:请求的格式不是 CF_HDROP
 const DATA_E_FORMATETC: HRESULT = HRESULT(0x80040064_u32 as _);
@@ -33,7 +34,12 @@ pub fn start_drag(paths: Vec<String>) -> DROPEFFECT {
         let dataobj: IDataObject = FileDataObject { paths }.into();
         let src: IDropSource = FileDropSource.into();
         let mut effect = DROPEFFECT_NONE;
-        let hr = DoDragDrop(&dataobj, &src, DROPEFFECT_COPY | DROPEFFECT_MOVE, &mut effect);
+        let hr = DoDragDrop(
+            &dataobj,
+            &src,
+            DROPEFFECT_COPY | DROPEFFECT_MOVE,
+            &mut effect,
+        );
         // 诊断:hr 里能看到 E_UNEXPECTED/CO_E_* 等失败原因;effect 为 NONE 表示目标拒绝。
         crate::dlog(&format!(
             "[dragout] DoDragDrop hr=0x{:08x} effect={}",
@@ -88,7 +94,20 @@ unsafe fn build_hdrop(paths: &[String]) -> Result<HGLOBAL> {
     Ok(hg)
 }
 
-/// 数据源支持的唯一格式:CF_HDROP / DVASPECT_CONTENT / TYMED_HGLOBAL / lindex=-1。
+/// 构造 Shell 拖放效果格式要求的 DWORD 全局内存块。
+unsafe fn build_drop_effect(effect: DROPEFFECT) -> Result<HGLOBAL> {
+    let hg = GlobalAlloc(GHND, size_of::<u32>())?;
+    let ptr = GlobalLock(hg);
+    if ptr.is_null() {
+        let _ = GlobalFree(Some(hg));
+        return Err(Error::from_hresult(E_UNEXPECTED));
+    }
+    std::ptr::write_unaligned(ptr as *mut u32, effect.0);
+    let _ = GlobalUnlock(hg);
+    Ok(hg)
+}
+
+/// 文件路径格式:CF_HDROP / DVASPECT_CONTENT / TYMED_HGLOBAL / lindex=-1。
 /// GetData/QueryGetData/EnumFormatEtc 三处必须用同一格式描述,否则目标会格式不匹配而拒绝。
 fn hdrop_format() -> FORMATETC {
     FORMATETC {
@@ -100,7 +119,37 @@ fn hdrop_format() -> FORMATETC {
     }
 }
 
-/// CF_HDROP 格式枚举(单元素)。Explorer 等目标在落点协商前会调用 EnumFormatEtc
+/// 告诉 Explorer：从栅栏正常拖出时首选“移动”。用户按住 Ctrl 时，目标仍可选择“复制”。
+fn preferred_drop_effect_format() -> FORMATETC {
+    FORMATETC {
+        cfFormat: unsafe { RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT) as u16 },
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0 as u32,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    }
+}
+
+fn format_at(pos: u32) -> Option<FORMATETC> {
+    match pos {
+        0 => Some(hdrop_format()),
+        1 => Some(preferred_drop_effect_format()),
+        _ => None,
+    }
+}
+
+fn is_supported_get_format(fmt: &FORMATETC) -> bool {
+    if fmt.dwAspect != DVASPECT_CONTENT.0 as u32
+        || fmt.lindex != -1
+        || fmt.tymed & TYMED_HGLOBAL.0 as u32 == 0
+    {
+        return false;
+    }
+    fmt.cfFormat == CF_HDROP.0 || fmt.cfFormat == preferred_drop_effect_format().cfFormat
+}
+
+/// 可读格式枚举：CF_HDROP 文件路径 + Preferred DropEffect 首选移动。
+/// Explorer 等目标在落点协商前会调用 EnumFormatEtc
 /// 枚举数据源支持的格式;若返回 E_NOTIMPL,部分目标直接判定"无可用格式"→ 禁止光标、拒绝落下。
 #[implement(IEnumFORMATETC)]
 pub struct FileFormatEnum {
@@ -115,8 +164,11 @@ impl IEnumFORMATETC_Impl for FileFormatEnum_Impl {
                 return E_INVALIDARG;
             }
             let mut n = 0u32;
-            while n < celt && self.pos.get() < 1 {
-                *rgelt.add(n as usize) = hdrop_format();
+            while n < celt {
+                let Some(fmt) = format_at(self.pos.get()) else {
+                    break;
+                };
+                *rgelt.add(n as usize) = fmt;
                 self.pos.set(self.pos.get() + 1);
                 n += 1;
             }
@@ -133,7 +185,7 @@ impl IEnumFORMATETC_Impl for FileFormatEnum_Impl {
     }
 
     fn Skip(&self, celt: u32) -> Result<()> {
-        let remain = 1u32.saturating_sub(self.pos.get());
+        let remain = 2u32.saturating_sub(self.pos.get());
         let skipped = remain.min(celt);
         self.pos.set(self.pos.get() + skipped);
         if skipped == celt {
@@ -150,7 +202,10 @@ impl IEnumFORMATETC_Impl for FileFormatEnum_Impl {
     }
 
     fn Clone(&self) -> Result<IEnumFORMATETC> {
-        let e: IEnumFORMATETC = FileFormatEnum { pos: Cell::new(self.pos.get()) }.into();
+        let e: IEnumFORMATETC = FileFormatEnum {
+            pos: Cell::new(self.pos.get()),
+        }
+        .into();
         Ok(e)
     }
 }
@@ -162,13 +217,14 @@ impl IDataObject_Impl for FileDataObject_Impl {
                 return Err(Error::from_hresult(DATA_E_FORMATETC));
             }
             let fmt = *pformatetcin;
-            if fmt.cfFormat != CF_HDROP.0
-                || fmt.dwAspect != DVASPECT_CONTENT.0 as u32
-                || fmt.lindex != -1
-            {
+            if !is_supported_get_format(&fmt) {
                 return Err(Error::from_hresult(DATA_E_FORMATETC));
             }
-            let hg = build_hdrop(&self.paths)?;
+            let hg = if fmt.cfFormat == CF_HDROP.0 {
+                build_hdrop(&self.paths)?
+            } else {
+                build_drop_effect(DROPEFFECT_MOVE)?
+            };
             let mut medium = STGMEDIUM::default();
             medium.tymed = TYMED_HGLOBAL.0 as u32;
             medium.u.hGlobal = hg;
@@ -186,10 +242,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
                 return DATA_E_FORMATETC;
             }
             let fmt = *pformatetc;
-            if fmt.cfFormat == CF_HDROP.0
-                && fmt.dwAspect == DVASPECT_CONTENT.0 as u32
-                && fmt.lindex == -1
-            {
+            if is_supported_get_format(&fmt) {
                 S_OK
             } else {
                 DATA_E_FORMATETC
@@ -197,7 +250,11 @@ impl IDataObject_Impl for FileDataObject_Impl {
         }
     }
 
-    fn GetCanonicalFormatEtc(&self, _pformatetcin: *const FORMATETC, _pformatetcout: *mut FORMATETC) -> HRESULT {
+    fn GetCanonicalFormatEtc(
+        &self,
+        _pformatetcin: *const FORMATETC,
+        _pformatetcout: *mut FORMATETC,
+    ) -> HRESULT {
         E_NOTIMPL
     }
 
@@ -211,7 +268,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
     }
 
     fn EnumFormatEtc(&self, dwdirection: u32) -> Result<IEnumFORMATETC> {
-        // DATADIR_GET = 1(读数据):返回 CF_HDROP 单格式枚举;
+        // DATADIR_GET = 1(读数据):返回文件路径与首选拖放效果;
         // DATADIR_SET = 2(写数据):只读数据源不支持,返回 E_NOTIMPL(标准行为)。
         if dwdirection != 1 {
             return Err(Error::from_hresult(E_NOTIMPL));
@@ -235,6 +292,34 @@ impl IDataObject_Impl for FileDataObject_Impl {
 
     fn EnumDAdvise(&self) -> Result<IEnumSTATDATA> {
         Err(Error::from_hresult(E_NOTIMPL))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertises_file_paths_and_move_preference() {
+        let paths = hdrop_format();
+        let preference = preferred_drop_effect_format();
+
+        assert_ne!(paths.cfFormat, preference.cfFormat);
+        assert!(is_supported_get_format(&paths));
+        assert!(is_supported_get_format(&preference));
+        assert!(format_at(2).is_none());
+    }
+
+    #[test]
+    fn preferred_effect_payload_requests_move() {
+        unsafe {
+            let hg = build_drop_effect(DROPEFFECT_MOVE).unwrap();
+            let ptr = GlobalLock(hg) as *const u32;
+            assert!(!ptr.is_null());
+            assert_eq!(std::ptr::read_unaligned(ptr), DROPEFFECT_MOVE.0);
+            let _ = GlobalUnlock(hg);
+            let _ = GlobalFree(Some(hg));
+        }
     }
 }
 
