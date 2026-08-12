@@ -53,9 +53,10 @@ use windows::Win32::System::Ole::RegisterDragDrop;
 use config::{Config, FenceCfg};
 use fence::{Fence, WM_APP_DROP};
 use tray::{
-    WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DOWNLOAD_ENABLED,
-    MENU_DOWNLOAD_VISIBLE, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX, MENU_NEW_PORTAL, MENU_RELOAD,
-    MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, add_tray, make_tray_icon, remove_tray, show_tray_menu,
+    WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DESKTOP_AVOID, MENU_DESKTOP_ROLLBACK,
+    MENU_DOWNLOAD_ENABLED, MENU_DOWNLOAD_VISIBLE, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX,
+    MENU_NEW_PORTAL, MENU_RELOAD, MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, add_tray,
+    make_tray_icon, remove_tray, show_tray_menu,
 };
 use utils::wstr;
 
@@ -424,6 +425,9 @@ fn apply_visibility(g: &mut Global) {
 }
 
 pub fn reserve_desktop_icons(g: &Global) {
+    if !g.config.desktop_avoid {
+        return;
+    }
     let rects: Vec<RECT> = g
         .fences
         .iter()
@@ -436,6 +440,26 @@ pub fn reserve_desktop_icons(g: &Global) {
         })
         .collect();
     desktop_icons::reserve(&rects);
+}
+
+/// 「撤销并关闭避让」:把避让期间被搬走的图标写回原位、被移动的栅栏恢复原状,
+/// 然后关闭避让并恢复自动排列样式。
+fn rollback_desktop(g: &mut Global) {
+    g.config.desktop_avoid = false; // 先关闭,后续 settle 内部的 reserve 会被 gate 住
+    desktop_icons::rollback_icons();
+    for (id, cfg) in desktop_icons::take_fence_history() {
+        if let Some(idx) = g.fences.iter().position(|f| f.cfg.id == id) {
+            // 恢复移动前的几何,再由 settle 磁吸回网格、同步分页并保存
+            g.fences[idx].cfg.x = cfg.x;
+            g.fences[idx].cfg.y = cfg.y;
+            g.fences[idx].cfg.w = cfg.w;
+            g.fences[idx].cfg.h = cfg.h;
+            fence::settle_fence(g, idx);
+        }
+    }
+    desktop_icons::restore_autoarrange();
+    g.config.fences = fence::config_snapshot(&g.fences);
+    config::save(&g.config);
 }
 
 // ---------- 桌面宿主重连(Explorer 重启防护) ----------
@@ -769,15 +793,17 @@ unsafe extern "system" fn msg_wndproc(
         if action == windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP as u32
             || action == windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU as u32
         {
-            let (zen, ghost, autostart, download_enabled, download_visible) = with_global(|g| {
-                (
-                    g.zen,
-                    g.config.ghost_mode,
-                    g.config.autostart,
-                    g.config.download_enabled,
-                    g.config.download_box_visible,
-                )
-            });
+            let (zen, ghost, autostart, download_enabled, download_visible, desktop_avoid) =
+                with_global(|g| {
+                    (
+                        g.zen,
+                        g.config.ghost_mode,
+                        g.config.autostart,
+                        g.config.download_enabled,
+                        g.config.download_box_visible,
+                        g.config.desktop_avoid,
+                    )
+                });
             let cmd = show_tray_menu(
                 hwnd,
                 zen,
@@ -785,6 +811,7 @@ unsafe extern "system" fn msg_wndproc(
                 autostart,
                 download_enabled,
                 download_visible,
+                desktop_avoid,
             );
             dispatch_menu(cmd);
         } else if action == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK as u32 {
@@ -934,6 +961,23 @@ fn dispatch_menu(cmd: u32) {
                     set_download_box_visible(g, !g.config.download_box_visible);
                 }
             });
+        }
+        MENU_DESKTOP_AVOID => {
+            with_global(|g| {
+                g.config.desktop_avoid = !g.config.desktop_avoid;
+                if g.config.desktop_avoid {
+                    reserve_desktop_icons(g);
+                } else {
+                    // 关闭避让:不回退图标(由「撤销并关闭避让」负责),
+                    // 只恢复自动排列样式并清空历史。
+                    desktop_icons::restore_autoarrange();
+                    desktop_icons::clear_history();
+                }
+                config::save(&g.config);
+            });
+        }
+        MENU_DESKTOP_ROLLBACK => {
+            with_global(|g| rollback_desktop(g));
         }
         MENU_AUTOSTART => {
             with_global(|g| {

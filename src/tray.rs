@@ -32,6 +32,8 @@ pub const MENU_EXIT: u32 = 2009;
 pub const MENU_RELOAD: u32 = 2010;
 pub const MENU_DOWNLOAD_ENABLED: u32 = 2011;
 pub const MENU_DOWNLOAD_VISIBLE: u32 = 2012;
+pub const MENU_DESKTOP_AVOID: u32 = 2013;
+pub const MENU_DESKTOP_ROLLBACK: u32 = 2014;
 
 pub fn make_tray_icon() -> HICON {
     // 16x16 三横条"栅栏"图标,带 alpha
@@ -118,6 +120,7 @@ pub fn show_tray_menu(
     autostart: bool,
     download_enabled: bool,
     download_visible: bool,
+    desktop_avoid: bool,
 ) -> u32 {
     unsafe {
         let menu = CreatePopupMenu().unwrap_or_default();
@@ -152,6 +155,14 @@ pub fn show_tray_menu(
             MENU_DOWNLOAD_VISIBLE as usize,
             PCWSTR(w!("显示下载收纳箱").as_ptr()),
         );
+        let _ = AppendMenuW(
+            menu,
+            if desktop_avoid { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
+            MENU_DESKTOP_AVOID as usize,
+            PCWSTR(w!("桌面图标避让").as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_STRING, MENU_DESKTOP_ROLLBACK as usize, PCWSTR(w!("撤销并关闭避让").as_ptr()));
+        let _ = AppendMenuW(menu, MF_GRAYED, 0, PCWSTR(w!("搬移后 1 分钟内可撤销").as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
             menu,

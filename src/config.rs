@@ -87,6 +87,10 @@ pub struct Config {
     /// - 缺省/1:旧版物理 x/y/w/h,未记录 DPI
     /// - 2:逻辑 x/y/w/h,启动时统一乘系统 DPI
     /// - 3:物理 x/y/w/h + 每栅栏保存时 DPI
+    /// 桌面图标避让:开启后栅栏覆盖的区域作为禁放区,把被盖住的桌面图标
+    /// 就近搬到空闲网格(默认关闭;开启会关闭 Explorer 的自动排列)。
+    #[serde(default)]
+    pub desktop_avoid: bool,
     #[serde(default)]
     pub version: u32,
 }
@@ -103,6 +107,7 @@ impl Default for Config {
             download_enabled: true,
             download_box_visible: true,
             icon: default_icon(),
+            desktop_avoid: false,
             version: 3,
         }
     }

@@ -1240,8 +1240,12 @@ unsafe extern "system" fn fence_wndproc(
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let ghost = g.config.ghost_mode;
+                    let avoid = g.config.desktop_avoid;
                     let f = &mut g.fences[idx];
                     if y < title_h(f.dpi) {
+                        if avoid {
+                            crate::desktop_icons::record_fence(&f.cfg);
+                        }
                         f.moving = true;
                         let mut cur = POINT::default();
                         let _ = GetCursorPos(&mut cur);
@@ -1250,6 +1254,9 @@ unsafe extern "system" fn fence_wndproc(
                         f.move_off = (cur.x - rc.left, cur.y - rc.top);
                         SetCapture(hwnd);
                     } else if let Some(dir) = resize_dir_at(f, x, y) {
+                        if avoid {
+                            crate::desktop_icons::record_fence(&f.cfg);
+                        }
                         f.resizing = Some(dir);
                         SetCapture(hwnd);
                     } else {
