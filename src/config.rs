@@ -35,6 +35,10 @@ fn default_title_font_size() -> u32 {
     12
 }
 
+pub fn normalize_title_font_size(value: u32) -> u32 {
+    value.clamp(10, 32)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -206,6 +210,13 @@ mod dpi_tests {
         assert!(c.download_enabled);
         assert!(c.download_box_visible);
         assert_eq!(c.title_font_size, 12);
+    }
+
+    #[test]
+    fn title_font_size_is_clamped_to_supported_bounds() {
+        assert_eq!(normalize_title_font_size(0), 10);
+        assert_eq!(normalize_title_font_size(18), 18);
+        assert_eq!(normalize_title_font_size(100), 32);
     }
 }
 

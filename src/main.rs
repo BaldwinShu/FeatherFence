@@ -990,6 +990,7 @@ fn dispatch_menu(cmd: u32) {
             with_global(|g| {
                 let mut c = config::load();
                 config::normalize_dpi(&mut c);
+                c.title_font_size = config::normalize_title_font_size(c.title_font_size);
                 fence::set_icon_px(c.icon);
                 fence::set_title_font_px(c.title_font_size);
                 g.config = c;
@@ -1136,6 +1137,7 @@ fn main() {
             .map(|f| f.icon)
             .unwrap_or(32);
     }
+    cfg.title_font_size = config::normalize_title_font_size(cfg.title_font_size);
     fence::set_icon_px(cfg.icon);
     fence::set_title_font_px(cfg.title_font_size);
     let vault = config::vault_dir(&cfg);
