@@ -14,6 +14,7 @@ mod dragout;
 mod droptarget;
 mod fence;
 mod icons;
+mod perf;
 mod tray;
 mod utils;
 mod watcher;
@@ -425,7 +426,7 @@ fn apply_visibility(g: &mut Global) {
 }
 
 pub fn reserve_desktop_icons(g: &Global) {
-    if !g.config.desktop_avoid {
+    if !g.config.desktop_avoid || perf::safe_desktop() {
         return;
     }
     let rects: Vec<RECT> = g
@@ -1038,6 +1039,7 @@ fn dispatch_menu(cmd: u32) {
 
 fn main() {
     dlog("[main] start");
+    perf::init();
     utils::set_dpi_awareness();
     dlog("[main] dpi set");
 
@@ -1257,6 +1259,13 @@ fn main() {
             g.watchers.push(ManagedWatcher::process(watcher));
         }
         reserve_desktop_icons(g);
+        if let Some(id) = perf::animation_fence_id() {
+            if let Some(f) = g.fences.iter_mut().find(|f| f.valid && f.cfg.id == id) {
+                if fence::start_perf_animation(f) {
+                    fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
+                }
+            }
+        }
     });
 
     dlog(&format!("[main] started, fences: {}", fences.len()));

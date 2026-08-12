@@ -5,6 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use windows::Win32::UI::Controls::IImageList;
 use windows::Win32::UI::Shell::{
     SHGetFileInfoW, SHGetImageList, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
@@ -23,6 +24,15 @@ unsafe impl Send for IconCache {}
 pub struct IconCache {
     map: HashMap<PathBuf, HICON>,
     lru: VecDeque<PathBuf>,
+    perf: IconPerfStats,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct IconPerfStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub hit_time: Duration,
+    pub miss_time: Duration,
 }
 
 /// 从系统图像列表按索引拿图标:EXTRALARGE(48)→LARGE(32) 依次尝试。
@@ -88,11 +98,17 @@ impl IconCache {
         IconCache {
             map: HashMap::new(),
             lru: VecDeque::new(),
+            perf: IconPerfStats::default(),
         }
     }
 
     pub fn get(&mut self, path: &Path) -> HICON {
+        let started = crate::perf::enabled().then(Instant::now);
         if let Some(&h) = self.map.get(path) {
+            if let Some(started) = started {
+                self.perf.hits += 1;
+                self.perf.hit_time += started.elapsed();
+            }
             return h;
         }
         let exists = path.exists();
@@ -122,6 +138,10 @@ impl IconCache {
         } else {
             hicon
         };
+        if let Some(started) = started {
+            self.perf.misses += 1;
+            self.perf.miss_time += started.elapsed();
+        }
         if hicon.is_invalid() {
             return hicon;
         }
@@ -135,6 +155,10 @@ impl IconCache {
             }
         }
         hicon
+    }
+
+    pub fn take_perf_stats(&mut self) -> IconPerfStats {
+        std::mem::take(&mut self.perf)
     }
 
     pub fn clear(&mut self) {
