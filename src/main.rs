@@ -2,6 +2,10 @@
 // 从终端 cargo run 启动时输出仍会显示在终端里(继承父进程句柄)。
 #![windows_subsystem = "windows"]
 
+// unsafe_op_in_unsafe_fn:本库以 `unsafe fn` 作为 Win32 FFI 的安全契约(每个调用点都
+// 在 unsafe fn 体内),再逐调用包 unsafe{} 属于重复标注,徒增噪音。函数签名已声明 unsafe。
+#![allow(unsafe_op_in_unsafe_fn)]
+
 // 轻栅栏 feather-fences:超轻量桌面分区整理工具
 // Rust + Win32 原生实现,Fences 轻量版(GPL-3.0,受 Fluid Fences 概念启发,代码为原创)
 mod config;
@@ -15,19 +19,17 @@ mod utils;
 mod watcher;
 
 use std::ffi::c_void;
-use std::ptr::NonNull;
-use std::mem::size_of;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, HWND, LPARAM, LRESULT,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT,
     RECT, SetLastError, WPARAM,
 };
-use windows::Win32::Graphics::GdiPlus::{GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GdiplusStartupOutput, Status};
+use windows::Win32::Graphics::GdiPlus::{GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GdiplusStartupOutput};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -40,9 +42,9 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetMessageW, GetWindow, GetWindowRect, HWND_TOP, IsIconic, IsWindow,
-    IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SetParent, SetWindowPos,
+    IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SetWindowPos,
     ShowWindow, GW_HWNDPREV,
-    TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW, WNDPROC,
+    TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW,
     WS_POPUP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
     SW_SHOWNOACTIVATE,
 };
@@ -51,7 +53,7 @@ use windows::Win32::System::Ole::RegisterDragDrop;
 use config::{Config, FenceCfg};
 use fence::{Fence, WM_APP_DROP};
 use tray::{
-    TRAY_ID, WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DOWNLOAD_ENABLED,
+    WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DOWNLOAD_ENABLED,
     MENU_DOWNLOAD_VISIBLE, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX, MENU_NEW_PORTAL, MENU_RELOAD,
     MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, add_tray, make_tray_icon, remove_tray, show_tray_menu,
 };
@@ -160,12 +162,6 @@ pub fn with_global<R>(f: impl FnOnce(&mut Global) -> R) -> R {
     result
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 // ---------- 栅栏生命周期 ----------
 
@@ -314,8 +310,8 @@ pub fn delete_fence(g: &mut Global, idx: usize) {
     g.watchers
         .retain(|watcher| watcher.owner != WatcherOwner::Fence(f.cfg.id));
     unsafe {
-        windows::Win32::System::Ole::RevokeDragDrop(f.hwnd);
-        DestroyWindow(f.hwnd);
+        let _ = windows::Win32::System::Ole::RevokeDragDrop(f.hwnd);
+        let _ = DestroyWindow(f.hwnd);
     }
     sync_config(g);
 }
@@ -419,9 +415,9 @@ fn apply_visibility(g: &mut Global) {
         }
         unsafe {
             if g.zen || !download_box_should_show(g, f.cfg.id) {
-                ShowWindow(f.hwnd, SW_HIDE);
+                let _ = ShowWindow(f.hwnd, SW_HIDE);
             } else {
-                ShowWindow(f.hwnd, SW_SHOWNA);
+                let _ = ShowWindow(f.hwnd, SW_SHOWNA);
             }
         }
     }
@@ -476,7 +472,7 @@ fn watchdog_tick(g: &mut Global) {
                 f.moving = false;
                 f.resizing = None;
                 if g.zen {
-                    unsafe { ShowWindow(hwnd, SW_HIDE); }
+                    unsafe { let _ = ShowWindow(hwnd, SW_HIDE); };
                 }
                 fence::refresh_entries(f, &config::vault_dir(&g.config));
                 fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
@@ -553,7 +549,7 @@ pub fn handle_drop(hwnd: HWND, paths: Vec<String>) {
             }
         }
         if moved > 0 {
-            unsafe { PostMessageW(Some(hwnd), WM_APP_DROP, WPARAM(0), LPARAM(0)); }
+            unsafe { let _ = PostMessageW(Some(hwnd), WM_APP_DROP, WPARAM(0), LPARAM(0)); };
         }
     });
 }
@@ -922,7 +918,7 @@ fn dispatch_menu(cmd: u32) {
             });
         }
         MENU_SWEEP => {
-            unsafe { PostMessageW(
+            let _ = unsafe { PostMessageW(
                 Some(with_global(|g| g.msg_hwnd)),
                 WM_APP_SWEEP,
                 WPARAM(0),
@@ -959,8 +955,8 @@ fn dispatch_menu(cmd: u32) {
                 let hwnds: Vec<HWND> = g.fences.iter().filter(|f| f.valid).map(|f| f.hwnd).collect();
                 for h in hwnds {
                     unsafe {
-                        windows::Win32::System::Ole::RevokeDragDrop(h);
-                        DestroyWindow(h);
+                        let _ = windows::Win32::System::Ole::RevokeDragDrop(h);
+                        let _ = DestroyWindow(h);
                     }
                 }
                 g.fences.clear();
@@ -988,7 +984,7 @@ fn dispatch_menu(cmd: u32) {
             }
         }
         MENU_EXIT => {
-            unsafe { PostMessageW(Some(with_global(|g| g.msg_hwnd)), WM_QUIT, WPARAM(0), LPARAM(0)); }
+            unsafe { let _ = PostMessageW(Some(with_global(|g| g.msg_hwnd)), WM_QUIT, WPARAM(0), LPARAM(0)); };
         }
         _ => {}
     }
@@ -1195,7 +1191,7 @@ fn main() {
                         .unwrap_or_default();
                     if rules.iter().any(|r| r.ext.to_lowercase() == ext) {
                         unsafe {
-                            PostMessageW(
+                            let _ = PostMessageW(
                                 Some(HWND(mhwnd as *mut c_void)),
                                 WM_APP_SWEEP,
                                 WPARAM(0),
@@ -1231,7 +1227,7 @@ fn main() {
             count += 1;
             if count % 2000 == 0 {
                 let hw = msg.hwnd;
-                let cls = unsafe {
+                let cls = {
                     let mut b = [0u16; 64];
                     windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hw, &mut b);
                     String::from_utf16_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(64)])
@@ -1245,7 +1241,7 @@ fn main() {
                 ));
                 last = std::time::Instant::now();
             }
-            TranslateMessage(&msg);
+            let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
@@ -1258,16 +1254,16 @@ fn main() {
         config::save(&g.config);
         for f in g.fences.iter() {
             if f.valid {
-                unsafe { windows::Win32::System::Ole::RevokeDragDrop(f.hwnd); }
+                unsafe { let _ = windows::Win32::System::Ole::RevokeDragDrop(f.hwnd); };
             }
         }
     });
     unsafe {
         remove_tray(msg_hwnd);
-        DestroyWindow(msg_hwnd);
+        let _ = DestroyWindow(msg_hwnd);
         GdiplusShutdown(token);
         OleUninitialize();
-        CloseHandle(mutex);
+        let _ = CloseHandle(mutex);
     }
     eprintln!("[feather] bye");
 }

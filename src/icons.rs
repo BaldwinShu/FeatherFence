@@ -130,7 +130,7 @@ impl IconCache {
         while self.lru.len() > CACHE_CAP {
             if let Some(old) = self.lru.pop_front() {
                 if let Some(h) = self.map.remove(&old) {
-                    unsafe { DestroyIcon(h) };
+                    let _ = unsafe { DestroyIcon(h) };
                 }
             }
         }
@@ -139,7 +139,7 @@ impl IconCache {
 
     pub fn clear(&mut self) {
         for (_, h) in self.map.drain() {
-            unsafe { DestroyIcon(h) };
+            let _ = unsafe { DestroyIcon(h) };
         }
         self.lru.clear();
     }

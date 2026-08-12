@@ -14,24 +14,6 @@ pub fn wstr(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
-/// 宽字符串 -> String(截到 0)
-pub fn from_wide(ptr: *const u16, max: usize) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    let mut v = Vec::new();
-    let mut i = 0usize;
-    while i < max {
-        let c = unsafe { *ptr.add(i) };
-        if c == 0 {
-            break;
-        }
-        v.push(c);
-        i += 1;
-    }
-    String::from_utf16_lossy(&v)
-}
-
 pub fn set_dpi_awareness() {
     unsafe {
         // 尽力而为:新 API 失败就退回旧 API

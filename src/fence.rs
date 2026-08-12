@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Gdi::{
     DeleteObject, EndPaint, SelectClipRgn, SelectObject, AC_SRC_ALPHA,
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY,
     CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DIB_RGB_COLORS, HBRUSH, HBITMAP,
-    HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    HDC, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
 };
 use windows::Win32::Graphics::GdiPlus::{
     GdipAddPathArc, GdipAddPathEllipse, GdipClosePathFigure, GdipCreateFont,
@@ -67,8 +67,6 @@ use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_P
 
 pub const WM_APP_REFRESH: u32 = WM_APP + 1;
 pub const WM_APP_DROP: u32 = WM_APP + 2;
-pub const WM_APP_MENU: u32 = WM_APP + 3;
-pub const WM_APP_RESIZED: u32 = WM_APP + 4;
 /// “显示桌面”会尝试最小化所有独立顶层窗口；异步恢复可避免在 WM_SIZE 内递归。
 pub const WM_APP_DESKTOP_RESTORE: u32 = WM_APP + 20;
 
@@ -130,9 +128,6 @@ fn cell_w(f: &Fence) -> i32 {
 }
 fn cell_h(f: &Fence) -> i32 {
     icon(f) + label_h(f.dpi)
-}
-fn radius(d: f32) -> f32 {
-    14.0 * d
 }
 pub fn min_w(d: f32) -> i32 {
     (180.0 * d) as i32
@@ -291,7 +286,7 @@ pub struct Fence {
     /// 目录监听线程与窗口消息之间的刷新合并信号。
     pub refresh_signal: RefreshSignal,
     /// 已渲染 DIB 缓存:ULW 整幅提交的源(内容不保留,必须自己存)
-    pub cache: Option<RenderCache>,
+    cache: Option<RenderCache>,
     pub valid: bool,
 }
 
@@ -347,8 +342,8 @@ fn ensure_cache(f: &mut Fence, w: i32, h: i32) -> *mut u8 {
     if need_new {
         if let Some(c) = f.cache.take() {
             unsafe {
-                DeleteObject(HGDIOBJ(c.hbmp.0));
-                DeleteDC(c.mdc);
+                let _ = DeleteObject(HGDIOBJ(c.hbmp.0));
+                let _ = DeleteDC(c.mdc);
             }
         }
         let mdc = unsafe { CreateCompatibleDC(None) };
@@ -373,7 +368,7 @@ fn ensure_cache(f: &mut Fence, w: i32, h: i32) -> *mut u8 {
                 });
             }
             Err(_) => {
-                unsafe { DeleteDC(mdc) };
+                let _ = unsafe { DeleteDC(mdc) };
                 f.cache = None;
             }
         }
@@ -466,10 +461,10 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             schedule_render(hwnd);
             // 自检:程序自己测命中(对比外部诊断,区分桌面/进程视角问题)
             let mut rc = RECT::default();
-            GetWindowRect(hwnd, &mut rc);
+            let _ = GetWindowRect(hwnd, &mut rc);
             let cx = (rc.left + rc.right) / 2;
             let cy = (rc.top + rc.bottom) / 2;
-            let hit = windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT { x: cx, y: cy });
+            let _hit = windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT { x: cx, y: cy });
             crate::dlog(&format!(
                 "[feather] created hwnd=0x{:x} at ({},{},{},{})",
                 hwnd.0 as usize, rc.left, rc.top, rc.right, rc.bottom
@@ -625,7 +620,7 @@ pub fn fence_menu(hwnd: HWND) {
         let is_download = with_global(|g| {
             fence_idx(g, hwnd).is_some_and(|i| g.config.download_box_id == Some(g.fences[i].cfg.id))
         });
-        AppendMenuW(
+        let _ = AppendMenuW(
             menu,
             MF_STRING,
             1001,
@@ -636,30 +631,30 @@ pub fn fence_menu(hwnd: HWND) {
             },
         );
         if is_download {
-            AppendMenuW(menu, MF_STRING, 1010, PCWSTR(w!("隐藏下载收纳箱").as_ptr()));
+            let _ = AppendMenuW(menu, MF_STRING, 1010, PCWSTR(w!("隐藏下载收纳箱").as_ptr()));
         }
-        AppendMenuW(menu, MF_STRING, 1011, PCWSTR(w!("打开收纳箱").as_ptr()));
-        AppendMenuW(menu, MF_STRING, 1005, PCWSTR(w!("重命名...").as_ptr()));
-        AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        AppendMenuW(menu, MF_STRING, 1002, PCWSTR(w!("透明度 100%").as_ptr()));
-        AppendMenuW(menu, MF_STRING, 1003, PCWSTR(w!("透明度 70%").as_ptr()));
-        AppendMenuW(menu, MF_STRING, 1004, PCWSTR(w!("透明度 45%").as_ptr()));
-        AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, 1011, PCWSTR(w!("打开收纳箱").as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING, 1005, PCWSTR(w!("重命名...").as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, 1002, PCWSTR(w!("透明度 100%").as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING, 1003, PCWSTR(w!("透明度 70%").as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING, 1004, PCWSTR(w!("透明度 45%").as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         // 图标大小子菜单(全局统一)
         let cur_icon = with_global(|g| g.config.icon.max(1));
         let icon_menu = CreatePopupMenu().unwrap_or_default();
         for (id, size) in [(1006u32, 24u32), (1007, 32), (1008, 48), (1009, 64)] {
             let flags = if cur_icon == size { MF_STRING | MF_CHECKED } else { MF_STRING };
-            AppendMenuW(
+            let _ = AppendMenuW(
                 icon_menu,
                 flags,
                 id as usize,
                 PCWSTR(wstr(&format!("{} px", size)).as_ptr()),
             );
         }
-        AppendMenuW(menu, MF_POPUP, icon_menu.0 as usize, PCWSTR(w!("图标大小").as_ptr()));
+        let _ = AppendMenuW(menu, MF_POPUP, icon_menu.0 as usize, PCWSTR(w!("图标大小").as_ptr()));
         let mut pt = POINT::default();
-        GetCursorPos(&mut pt);
+        let _ = GetCursorPos(&mut pt);
         let cmd = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_NONOTIFY,
@@ -669,7 +664,7 @@ pub fn fence_menu(hwnd: HWND) {
             hwnd,
             None,
         );
-        DestroyMenu(menu);
+        let _ = DestroyMenu(menu);
         let cmd = cmd.0 as u32;
         if cmd == 1001 {
             with_global(|g| {
@@ -782,14 +777,14 @@ unsafe extern "system" fn input_wndproc(
                     let n = GetWindowTextW(edit, &mut buf);
                     *PROMPT_RESULT.lock().unwrap() =
                         Some(String::from_utf16_lossy(&buf[..(n.max(0) as usize).min(buf.len())]));
-                    DestroyWindow(hwnd);
+                    let _ = DestroyWindow(hwnd);
                 } else if id == 2 {
-                    DestroyWindow(hwnd);
+                    let _ = DestroyWindow(hwnd);
                 }
                 return LRESULT(0);
             }
             WM_CLOSE => {
-                DestroyWindow(hwnd);
+                let _ = DestroyWindow(hwnd);
                 return LRESULT(0);
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -838,7 +833,7 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
         let dh = wr.bottom - wr.top;
 
         let mut prc = RECT::default();
-        GetWindowRect(parent, &mut prc);
+        let _ = GetWindowRect(parent, &mut prc);
         // 定位到栅栏附近,但不出屏幕工作区
         let wa = crate::utils::work_area(parent);
         let dx = (prc.left + (prc.right - prc.left - dw) / 2).clamp(wa.left, wa.right - dw);
@@ -937,7 +932,7 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
         set_font(cancel);
         *PROMPT_EDIT.lock().unwrap() = edit.0 as usize;
         *PROMPT_RESULT.lock().unwrap() = None;
-        ShowWindow(dlg, SW_SHOW);
+        let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
         let _ = SetActiveWindow(dlg);
         let _ = SetFocus(Some(edit));
@@ -1086,7 +1081,7 @@ unsafe extern "system" fn fence_wndproc(
                         }
                         if f.moving {
                             let mut cur = POINT::default();
-                            GetCursorPos(&mut cur);
+                            let _ = GetCursorPos(&mut cur);
                             // 连续磁吸:平滑拉向最近格点,越近拉得越紧(无瞬移跳变);
                             // 同时 clamp 进工作区,防拖出屏幕
                             let wa = work_area(hwnd);
@@ -1112,9 +1107,9 @@ unsafe extern "system" fn fence_wndproc(
                             // 拖动中不重绘(内容没变;避免每帧全量重绘导致窗口忙/转圈)
                         } else if let Some(dir) = f.resizing {
                             let mut cur = POINT::default();
-                            GetCursorPos(&mut cur);
+                            let _ = GetCursorPos(&mut cur);
                             let mut rc = RECT::default();
-                            GetWindowRect(hwnd, &mut rc);
+                            let _ = GetWindowRect(hwnd, &mut rc);
                             let (mut nx, mut ny, mut nw, mut nh) = (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
                             let apply = |nx: &mut i32, ny: &mut i32, nw: &mut i32, nh: &mut i32, dir: ResizeDir| {
                                 match dir {
@@ -1165,7 +1160,7 @@ unsafe extern "system" fn fence_wndproc(
                                 f.hover = None;
                                 if let Some(didx) = didx {
                                     if let Some(p) = f.entries.get(didx).map(|e| e.path.clone()) {
-                                        unsafe { ReleaseCapture(); }
+                                        unsafe { let _ = ReleaseCapture(); };
                                         let vault = crate::config::vault_dir(&g.config);
                                         drag_path = Some((p.to_string_lossy().to_string(), vault));
                                     }
@@ -1217,9 +1212,9 @@ unsafe extern "system" fn fence_wndproc(
                     if y < title_h(f.dpi) {
                         f.moving = true;
                         let mut cur = POINT::default();
-                        GetCursorPos(&mut cur);
+                        let _ = GetCursorPos(&mut cur);
                         let mut rc = RECT::default();
-                        GetWindowRect(hwnd, &mut rc);
+                        let _ = GetWindowRect(hwnd, &mut rc);
                         f.move_off = (cur.x - rc.left, cur.y - rc.top);
                         SetCapture(hwnd);
                     } else if let Some(dir) = resize_dir_at(f, x, y) {
@@ -1252,7 +1247,7 @@ unsafe extern "system" fn fence_wndproc(
                     // 普通单击(未达拖拽阈值)也会到这里:清除潜在拖出
                     g.fences[idx].drag_idx = None;
                     if was_drag || had_item_press {
-                        ReleaseCapture();
+                        let _ = ReleaseCapture();
                     }
                     if was_drag {
                         // 松手整理:吸附网格尺寸/位置 + clamp 工作区 + 重叠推挤到空闲槽位 + 保存
@@ -1376,9 +1371,9 @@ unsafe extern "system" fn fence_wndproc(
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let f = &g.fences[idx];
                     let mut pt = POINT::default();
-                    GetCursorPos(&mut pt);
+                    let _ = GetCursorPos(&mut pt);
                     let mut cpt = pt;
-                    windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut cpt);
+                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut cpt);
                     let cursor = if cpt.y < title_h(f.dpi) {
                         IDC_SIZEALL
                     } else if let Some(d) = resize_dir_at(f, cpt.x, cpt.y) {
@@ -2187,7 +2182,7 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                 let _ = DrawIconEx(memdc, *ix, *iy, *hicon, icol, icol, 0, None, DI_NORMAL);
             }
             SelectClipRgn(memdc, None);
-            DeleteObject(HGDIOBJ(rgn.0));
+            let _ = DeleteObject(HGDIOBJ(rgn.0));
         } else {
             for (ix, iy, hicon) in &icons_to_draw {
                 let _ = DrawIconEx(memdc, *ix, *iy, *hicon, icol, icol, 0, None, DI_NORMAL);
