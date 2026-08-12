@@ -990,6 +990,8 @@ fn dispatch_menu(cmd: u32) {
             with_global(|g| {
                 let mut c = config::load();
                 config::normalize_dpi(&mut c);
+                fence::set_icon_px(c.icon);
+                fence::set_title_font_px(c.title_font_size);
                 g.config = c;
                 // 保留进程级监听（桌面清扫和 Downloads 接管）；先停止所有栅栏监听，
                 // 避免窗口销毁期间仍收到刷新。
@@ -1135,6 +1137,7 @@ fn main() {
             .unwrap_or(32);
     }
     fence::set_icon_px(cfg.icon);
+    fence::set_title_font_px(cfg.title_font_size);
     let vault = config::vault_dir(&cfg);
     let _ = std::fs::create_dir_all(&vault);
 

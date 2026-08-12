@@ -95,7 +95,7 @@ pub fn window_dpi(hwnd: HWND) -> f32 {
     unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32 / 96.0 }.max(1.0)
 }
 pub fn title_h(d: f32) -> i32 {
-    (30.0 * d) as i32
+    ((TITLE_FONT_PX.load(AtomicOrdering::Relaxed) as f32 + 18.0) * d).round() as i32
 }
 fn edge(d: f32) -> i32 {
     (8.0 * d) as i32
@@ -109,9 +109,15 @@ fn rail(d: f32) -> i32 {
 }
 /// 全局图标尺寸(逻辑像素):所有栅栏统一
 static ICON_PX: AtomicU32 = AtomicU32::new(32);
+/// 全局栅栏标题字号(逻辑像素):所有栅栏统一
+static TITLE_FONT_PX: AtomicU32 = AtomicU32::new(12);
 /// 设置全局图标尺寸(物理显示时再乘 DPI)
 pub fn set_icon_px(v: u32) {
     ICON_PX.store(v.max(16).min(128), AtomicOrdering::Relaxed);
+}
+/// 设置全局栅栏标题字号(物理显示时再乘 DPI)
+pub fn set_title_font_px(v: u32) {
+    TITLE_FONT_PX.store(v.clamp(10, 32), AtomicOrdering::Relaxed);
 }
 /// 图标尺寸(物理像素,按所在屏 DPI 缩放);取全局值,0 时回退 32
 fn icon(f: &Fence) -> i32 {
@@ -136,7 +142,7 @@ pub fn min_h(d: f32) -> i32 {
     (100.0 * d) as i32
 }
 fn font_title(d: f32) -> f32 {
-    11.5 * d
+    TITLE_FONT_PX.load(AtomicOrdering::Relaxed) as f32 * d
 }
 fn font_label(d: f32) -> f32 {
     // Windows 桌面图标的标签字号:9pt = 12px(逻辑像素,随 DPI 缩放)
@@ -684,6 +690,35 @@ pub fn fence_menu(hwnd: HWND) {
             );
         }
         let _ = AppendMenuW(menu, MF_POPUP, icon_menu.0 as usize, PCWSTR(w!("图标大小").as_ptr()));
+        // 标题字号子菜单(全局统一)
+        let cur_title_font = with_global(|g| g.config.title_font_size.max(1));
+        let title_font_menu = CreatePopupMenu().unwrap_or_default();
+        for (id, size) in [
+            (1013u32, 12u32),
+            (1014, 14),
+            (1015, 16),
+            (1016, 18),
+            (1017, 20),
+            (1018, 24),
+        ] {
+            let flags = if cur_title_font == size {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            let _ = AppendMenuW(
+                title_font_menu,
+                flags,
+                id as usize,
+                PCWSTR(wstr(&format!("{} px", size)).as_ptr()),
+            );
+        }
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            title_font_menu.0 as usize,
+            PCWSTR(w!("标题字号").as_ptr()),
+        );
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let cmd = TrackPopupMenu(
@@ -754,6 +789,24 @@ pub fn fence_menu(hwnd: HWND) {
                 set_icon_px(size);
                 g.config.icon = size;
                 // 图标尺寸变化 → 网格槽位/页数全变:所有栅栏重新吸附到新网格
+                let n = g.fences.len();
+                for i in 0..n {
+                    settle_fence(g, i);
+                }
+            });
+        } else if (1013..=1018).contains(&cmd) {
+            let size = match cmd {
+                1013 => 12,
+                1014 => 14,
+                1015 => 16,
+                1016 => 18,
+                1017 => 20,
+                _ => 24,
+            };
+            with_global(|g| {
+                set_title_font_px(size);
+                g.config.title_font_size = size;
+                // 标题栏高度随字号变化;重新吸附可保留完整图标行并避免文字被裁切。
                 let n = g.fences.len();
                 for i in 0..n {
                     settle_fence(g, i);
