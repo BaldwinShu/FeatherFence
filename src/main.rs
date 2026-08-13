@@ -547,20 +547,55 @@ fn desktop_layer_tick(g: &mut Global) {
 
 // ---------- 拖放处理 ----------
 
-pub fn handle_drop(hwnd: HWND, paths: Vec<String>) {
-    with_global(|g| {
+fn format_drop_failures(target: &Path, moved: usize, failures: &[(String, String)]) -> String {
+    const MAX_DETAILS: usize = 5;
+    let mut message = format!(
+        "有 {} 个项目未能移动到：\n{}\n\n",
+        failures.len(),
+        target.display()
+    );
+    if moved > 0 {
+        message.push_str(&format!("已成功移动 {moved} 个项目。\n\n"));
+    }
+    for (path, error) in failures.iter().take(MAX_DETAILS) {
+        let name = Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| path.into());
+        message.push_str(&format!("• {name}：{error}\n"));
+    }
+    if failures.len() > MAX_DETAILS {
+        message.push_str(&format!("• 另有 {} 个项目未列出\n", failures.len() - MAX_DETAILS));
+    }
+    message.push_str("\n请检查原位置和目标目录后重试。程序不会主动删除未成功移动的源项目。");
+    message
+}
+
+/// 处理拖入并返回是否至少移动了一个项目，供 OLE 向数据源报告真实结果。
+pub fn handle_drop(hwnd: HWND, paths: Vec<String>) -> bool {
+    let result = with_global(|g| {
         let Some(idx) = g.fences.iter().position(|f| f.valid && f.hwnd == hwnd) else {
-            return;
+            return None;
         };
-        let target: Option<PathBuf> = g.fences[idx].cfg.folder.clone().or_else(|| {
-            let v = config::vault_dir(&g.config);
-            config::ensure_dir(&v).then_some(v)
-        });
-        let Some(target) = target else { return };
+        let target = if let Some(folder) = g.fences[idx].cfg.folder.clone() {
+            folder
+        } else {
+            let vault = config::vault_dir(&g.config);
+            if !config::ensure_dir(&vault) {
+                let failures = paths
+                    .iter()
+                    .map(|path| (path.clone(), "无法创建或访问栅栏存储目录".to_string()))
+                    .collect();
+                return Some((vault, 0, failures));
+            }
+            vault
+        };
         let mut moved = 0usize;
+        let mut failures = Vec::new();
         for p in &paths {
             let src = PathBuf::from(p);
             if !src.exists() {
+                failures.push((p.clone(), "源项目不存在或已被移动".to_string()));
                 continue;
             }
             // 已在目标目录里则跳过
@@ -569,13 +604,55 @@ pub fn handle_drop(hwnd: HWND, paths: Vec<String>) {
             }
             match watcher::move_to_dir(&src, &target) {
                 Ok(_) => moved += 1,
-                Err(e) => eprintln!("[feather] move {p} -> {} failed: {e}", target.display()),
+                Err(e) => {
+                    eprintln!("[feather] move {p} -> {} failed: {e}", target.display());
+                    failures.push((p.clone(), e));
+                }
             }
         }
         if moved > 0 {
             unsafe { let _ = PostMessageW(Some(hwnd), WM_APP_DROP, WPARAM(0), LPARAM(0)); };
         }
+        Some((target, moved, failures))
     });
+
+    let Some((target, moved, failures)) = result else {
+        return false;
+    };
+    if !failures.is_empty() {
+        let message = format_drop_failures(&target, moved, &failures);
+        let message_w = wstr(&message);
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                Some(hwnd),
+                PCWSTR(message_w.as_ptr()),
+                w!("FeatherFence - 文件移动失败"),
+                windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE(0x10),
+            );
+        }
+    }
+    moved > 0
+}
+
+#[cfg(test)]
+mod drop_feedback_tests {
+    use super::format_drop_failures;
+    use std::path::Path;
+
+    #[test]
+    fn failure_message_limits_details_and_reports_partial_success() {
+        let failures: Vec<_> = (0..7)
+            .map(|i| (format!("C:\\source\\file-{i}.txt"), "拒绝访问".to_string()))
+            .collect();
+
+        let message = format_drop_failures(Path::new("D:\\target"), 2, &failures);
+
+        assert!(message.contains("有 7 个项目未能移动"));
+        assert!(message.contains("已成功移动 2 个项目"));
+        assert!(message.contains("file-0.txt"));
+        assert!(!message.contains("file-5.txt"));
+        assert!(message.contains("另有 2 个项目未列出"));
+    }
 }
 
 // ---------- 自动归类 ----------

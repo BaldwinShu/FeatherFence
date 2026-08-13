@@ -221,8 +221,11 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
                 *pdweffect = DROPEFFECT_NONE;
                 return Ok(());
             }
-            *pdweffect = DROPEFFECT_MOVE;
-            crate::handle_drop(self.hwnd, paths);
+            *pdweffect = if crate::handle_drop(self.hwnd, paths) {
+                DROPEFFECT_MOVE
+            } else {
+                DROPEFFECT_NONE
+            };
         }
         Ok(())
     }
