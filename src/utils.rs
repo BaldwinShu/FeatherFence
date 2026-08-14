@@ -5,31 +5,13 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITOR_DEFAULTTONEAREST, MONITORINFO};
 use windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, FindWindowW, GetClassNameW, GetSystemMetrics, SendMessageW,
-    SetProcessDPIAware, SM_CXSCREEN, SM_CYSCREEN,
+    EnumChildWindows, EnumWindows, FindWindowW, GetClassNameW, GetSystemMetrics,
+    SendMessageW, SetProcessDPIAware, SM_CXSCREEN, SM_CYSCREEN,
 };
 
 /// UTF-8 -> 以 0 结尾的 UTF-16
 pub fn wstr(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
-}
-
-/// 宽字符串 -> String(截到 0)
-pub fn from_wide(ptr: *const u16, max: usize) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    let mut v = Vec::new();
-    let mut i = 0usize;
-    while i < max {
-        let c = unsafe { *ptr.add(i) };
-        if c == 0 {
-            break;
-        }
-        v.push(c);
-        i += 1;
-    }
-    String::from_utf16_lossy(&v)
 }
 
 pub fn set_dpi_awareness() {
@@ -67,6 +49,7 @@ pub fn work_area(hwnd: HWND) -> RECT {
 }
 
 static mut FOUND_HOST: Option<HWND> = None;
+static mut FOUND_LIST: Option<HWND> = None;
 static SPIF_SENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 桌面层宿主查找:优先 Progman(桌面最底),其次 WorkerW。
@@ -117,6 +100,16 @@ unsafe extern "system" fn enum_child_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
     BOOL(1)
 }
 
+unsafe extern "system" fn enum_list_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(hwnd, &mut cls);
+    if n > 0 && String::from_utf16_lossy(&cls[..n as usize]) == "SysListView32" {
+        unsafe { FOUND_LIST = Some(hwnd) };
+        return BOOL(0);
+    }
+    BOOL(1)
+}
+
 unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
     let mut cls = [0u16; 64];
     let n = GetClassNameW(hwnd, &mut cls);
@@ -162,5 +155,22 @@ pub fn find_desktop_host() -> Option<HWND> {
             return Some(progman);
         }
         None
+    }
+}
+
+/// 找到 Explorer 中承载桌面原生图标的 SysListView32。
+pub fn find_desktop_listview() -> Option<HWND> {
+    unsafe {
+        FOUND_LIST = None;
+        let host = find_desktop_host()?;
+        let _ = EnumChildWindows(Some(host), Some(enum_list_proc), LPARAM(0));
+        let first = FOUND_LIST;
+        if first.is_none() {
+            // Progman 作为兜底宿主时，图标列表可能多嵌套一层。
+            if let Ok(progman) = FindWindowW(w!("Progman"), None) {
+                let _ = EnumChildWindows(Some(progman), Some(enum_list_proc), LPARAM(0));
+            }
+        }
+        FOUND_LIST
     }
 }

@@ -2,9 +2,14 @@
 // 从终端 cargo run 启动时输出仍会显示在终端里(继承父进程句柄)。
 #![windows_subsystem = "windows"]
 
+// unsafe_op_in_unsafe_fn:本库以 `unsafe fn` 作为 Win32 FFI 的安全契约(每个调用点都
+// 在 unsafe fn 体内),再逐调用包 unsafe{} 属于重复标注,徒增噪音。函数签名已声明 unsafe。
+#![allow(unsafe_op_in_unsafe_fn)]
+
 // 轻栅栏 feather-fences:超轻量桌面分区整理工具
 // Rust + Win32 原生实现,Fences 轻量版(GPL-3.0,受 Fluid Fences 概念启发,代码为原创)
 mod config;
+mod desktop_icons;
 mod dragout;
 mod droptarget;
 mod fence;
@@ -14,17 +19,17 @@ mod utils;
 mod watcher;
 
 use std::ffi::c_void;
-use std::ptr::NonNull;
-use std::mem::size_of;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, HWND, LPARAM, LRESULT,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT,
     RECT, SetLastError, WPARAM,
 };
-use windows::Win32::Graphics::GdiPlus::{GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GdiplusStartupOutput, Status};
+use windows::Win32::Graphics::GdiPlus::{GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GdiplusStartupOutput};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -35,19 +40,23 @@ use windows::Win32::UI::Shell::{
     BIF_RETURNONLYFSDIRS, BROWSEINFOW, FOLDERID_Desktop, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowRect,
-    HWND_MESSAGE, PostMessageW, PostQuitMessage, RegisterClassW, SetParent, SetWindowPos,
-    ShowWindow, TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW,
-    WNDPROC, WS_POPUP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetMessageW, GetWindow, GetWindowRect, HWND_TOP, IsIconic, IsWindow,
+    IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SetWindowPos,
+    ShowWindow, GW_HWNDPREV,
+    TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW,
+    WS_POPUP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
+    SW_SHOWNOACTIVATE,
 };
 use windows::Win32::System::Ole::RegisterDragDrop;
 
 use config::{Config, FenceCfg};
 use fence::{Fence, WM_APP_DROP};
 use tray::{
-    WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX,
-    MENU_NEW_PORTAL, MENU_RELOAD, MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, add_tray, make_tray_icon,
-    remove_tray, show_tray_menu,
+    WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DESKTOP_AVOID, MENU_DESKTOP_ROLLBACK,
+    MENU_DOWNLOAD_ENABLED, MENU_DOWNLOAD_VISIBLE, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX,
+    MENU_NEW_PORTAL, MENU_RELOAD, MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, add_tray,
+    make_tray_icon, remove_tray, show_tray_menu,
 };
 use utils::wstr;
 
@@ -62,11 +71,49 @@ pub struct Global {
     pub desktop_host: Option<HWND>,
     pub icons: icons::IconCache,
     pub sweep_retry: Vec<(PathBuf, PathBuf)>,
+    /// 桌面监听线程传来的文件名；主线程等待写入稳定后移入下载收纳箱。
+    pub desktop_rx: Receiver<Vec<String>>,
+    pub desktop_seen: HashSet<PathBuf>,
+    pub download_rx: Receiver<Vec<String>>,
+    pub download_pending: HashMap<PathBuf, DownloadCandidate>,
     pub exiting: bool,
     /// 拖放 COM 对象,保持存活
     pub droptargets: Vec<windows::Win32::System::Ole::IDropTarget>,
-    /// 桌面自动归类目录监听(栅栏自身的 watcher 随 Fence 存放,删除/重载自动停止)
-    pub watchers: Vec<watcher::DirWatcher>,
+    /// 目录监听线程
+    pub watchers: Vec<ManagedWatcher>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WatcherOwner {
+    Process,
+    Fence(u32),
+}
+
+pub struct ManagedWatcher {
+    owner: WatcherOwner,
+    _watcher: watcher::DirWatcher,
+}
+
+impl ManagedWatcher {
+    fn process(watcher: watcher::DirWatcher) -> Self {
+        Self {
+            owner: WatcherOwner::Process,
+            _watcher: watcher,
+        }
+    }
+
+    fn fence(id: u32, watcher: watcher::DirWatcher) -> Self {
+        Self {
+            owner: WatcherOwner::Fence(id),
+            _watcher: watcher,
+        }
+    }
+}
+
+pub struct DownloadCandidate {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    stable_ticks: u8,
 }
 
 static G: OnceLock<Mutex<Global>> = OnceLock::new();
@@ -116,12 +163,6 @@ pub fn with_global<R>(f: impl FnOnce(&mut Global) -> R) -> R {
     result
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 // ---------- 栅栏生命周期 ----------
 
@@ -240,12 +281,18 @@ pub fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     f.cfg.pos_set = Some(true); // 位置已确定(含恰好 (0,0) 的情况)
     fence::refresh_entries(&mut f, &config::vault_dir(&g.config));
     fence::render_fence(&mut g.icons, g.config.ghost_mode, &mut f);
+    let id = f.cfg.id;
     // 目录监听(所有栅栏):文件夹栅栏监听门户目录,收纳栅栏监听收纳箱目录。
     // 通知按栅栏 id 发给消息窗口——不持有具体 hwnd,窗口被 Explorer 销毁重建后
-    // watcher 无需重绑仍能按 id 找到新窗口;watcher 随 Fence 析构自动停止。
+    // watcher 无需重绑仍能按 id 找到新窗口;删除栅栏/重载时随 ManagedWatcher 停止。
     let watch_dir = f.cfg.folder.clone().unwrap_or_else(|| config::vault_dir(&g.config));
-    let fid = f.cfg.id;
+    let fid = id;
     let mhwnd = g.msg_hwnd.0 as usize;
+    g.fences.push(f);
+    // 新栅栏立即落到网格:尺寸/位置吸附 + clamp 工作区 + 消除重叠
+    let new_idx = g.fences.len() - 1;
+    fence::settle_fence(g, new_idx);
+
     let watcher = watcher::spawn_dir_watcher(watch_dir, move |_names| {
         unsafe {
             PostMessageW(
@@ -256,12 +303,7 @@ pub fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
             );
         }
     });
-    f.watcher = Some(watcher);
-    let id = f.cfg.id;
-    g.fences.push(f);
-    // 新栅栏立即落到网格:尺寸/位置吸附 + clamp 工作区 + 消除重叠
-    let new_idx = g.fences.len() - 1;
-    fence::settle_fence(g, new_idx);
+    g.watchers.push(ManagedWatcher::fence(fid, watcher));
     sync_config(g);
     id
 }
@@ -270,14 +312,104 @@ pub fn delete_fence(g: &mut Global, idx: usize) {
     if idx >= g.fences.len() {
         return;
     }
-    let f = &g.fences[idx];
+    // 先从全局状态移除，DestroyWindow 同步派发 WM_DESTROY 时就不会把条目标成
+    // “意外失效”并被 watchdog 重建。对应监听器在窗口销毁前停止，避免继续投递刷新。
+    let f = g.fences.remove(idx);
+    g.watchers
+        .retain(|watcher| watcher.owner != WatcherOwner::Fence(f.cfg.id));
     unsafe {
-        windows::Win32::System::Ole::RevokeDragDrop(f.hwnd);
-        DestroyWindow(f.hwnd);
+        let _ = windows::Win32::System::Ole::RevokeDragDrop(f.hwnd);
+        let _ = DestroyWindow(f.hwnd);
     }
-    // Fence 析构 → 其目录监听 watcher 自动 stop(线程退出,不再向死窗口投递消息)
-    g.fences.remove(idx);
     sync_config(g);
+}
+
+fn ensure_download_box(g: &mut Global) {
+    let dir = config::download_box_dir();
+    let exists = g
+        .config
+        .download_box_id
+        .is_some_and(|id| g.fences.iter().any(|f| f.valid && f.cfg.id == id));
+    if exists {
+        return;
+    }
+    if let Some(id) = g
+        .fences
+        .iter()
+        .find(|f| f.valid && f.cfg.folder.as_deref() == Some(dir.as_path()))
+        .map(|f| f.cfg.id)
+    {
+        g.config.download_box_id = Some(id);
+        sync_config(g);
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let (sw, _sh) = utils::screen_size();
+    let s = fence::dpi_scale();
+    let cfg = FenceCfg {
+        id: 0,
+        title: "下载收纳箱".into(),
+        folder: Some(dir),
+        x: sw - (320.0 * s) as i32,
+        y: (100.0 * s) as i32,
+        w: (260.0 * s) as i32,
+        h: (340.0 * s) as i32,
+        dpi: (96.0 * s).round() as u32,
+        opacity: 0.7,
+        icon: 32,
+        pos_set: None,
+    };
+    let id = create_fence(g, cfg);
+    if id != 0 {
+        g.config.download_box_id = Some(id);
+        sync_config(g);
+    }
+}
+
+fn is_download_box(g: &Global, id: u32) -> bool {
+    g.config.download_box_id == Some(id)
+}
+
+fn download_box_should_show(g: &Global, id: u32) -> bool {
+    !is_download_box(g, id) || (g.config.download_enabled && g.config.download_box_visible)
+}
+
+fn downloads_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(|p| PathBuf::from(p).join("Downloads"))
+}
+
+fn reset_download_tracking(g: &mut Global) {
+    while g.download_rx.try_recv().is_ok() {}
+    g.download_pending.clear();
+    g.desktop_seen = downloads_dir()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+}
+
+pub fn set_download_enabled(g: &mut Global, enabled: bool) {
+    if g.config.download_enabled == enabled {
+        return;
+    }
+    g.config.download_enabled = enabled;
+    reset_download_tracking(g);
+    apply_visibility(g);
+    reserve_desktop_icons(g);
+    config::save(&g.config);
+}
+
+pub fn set_download_box_visible(g: &mut Global, visible: bool) {
+    if g.config.download_box_visible == visible {
+        return;
+    }
+    g.config.download_box_visible = visible;
+    apply_visibility(g);
+    reserve_desktop_icons(g);
+    config::save(&g.config);
 }
 
 fn sync_config(g: &mut Global) {
@@ -291,13 +423,51 @@ fn apply_visibility(g: &mut Global) {
             continue;
         }
         unsafe {
-            if g.zen {
-                ShowWindow(f.hwnd, SW_HIDE);
+            if g.zen || !download_box_should_show(g, f.cfg.id) {
+                let _ = ShowWindow(f.hwnd, SW_HIDE);
             } else {
-                ShowWindow(f.hwnd, SW_SHOWNA);
+                let _ = ShowWindow(f.hwnd, SW_SHOWNA);
             }
         }
     }
+}
+
+pub fn reserve_desktop_icons(g: &Global) {
+    if !g.config.desktop_avoid {
+        return;
+    }
+    let rects: Vec<RECT> = g
+        .fences
+        .iter()
+        .filter(|f| f.valid && download_box_should_show(g, f.cfg.id))
+        .map(|f| RECT {
+            left: f.cfg.x,
+            top: f.cfg.y,
+            right: f.cfg.x + f.cfg.w,
+            bottom: f.cfg.y + f.cfg.h,
+        })
+        .collect();
+    desktop_icons::reserve(&rects);
+}
+
+/// 「撤销并关闭避让」:把避让期间被搬走的图标写回原位、被移动的栅栏恢复原状,
+/// 然后关闭避让并恢复自动排列样式。
+fn rollback_desktop(g: &mut Global) {
+    g.config.desktop_avoid = false; // 先关闭,后续 settle 内部的 reserve 会被 gate 住
+    desktop_icons::rollback_icons();
+    for (id, cfg) in desktop_icons::take_fence_history() {
+        if let Some(idx) = g.fences.iter().position(|f| f.cfg.id == id) {
+            // 恢复移动前的几何,再由 settle 磁吸回网格、同步分页并保存
+            g.fences[idx].cfg.x = cfg.x;
+            g.fences[idx].cfg.y = cfg.y;
+            g.fences[idx].cfg.w = cfg.w;
+            g.fences[idx].cfg.h = cfg.h;
+            fence::settle_fence(g, idx);
+        }
+    }
+    desktop_icons::restore_autoarrange();
+    g.config.fences = fence::config_snapshot(&g.fences);
+    config::save(&g.config);
 }
 
 // ---------- 桌面宿主重连(Explorer 重启防护) ----------
@@ -305,7 +475,19 @@ fn apply_visibility(g: &mut Global) {
 fn watchdog_tick(g: &mut Global) {
     // 窗口已独立于桌面层(不挂 Progman),无需宿主检测;
     // 之前 EnumWindows + SendMessageW(0x052C) 在 Progman 无响应时会卡死主线程
+    let download_id = g.config.download_box_id;
+    let download_shown = g.config.download_enabled && g.config.download_box_visible;
     for f in g.fences.iter_mut() {
+        let intentionally_hidden = download_id == Some(f.cfg.id) && !download_shown;
+        if f.valid && !g.zen && !intentionally_hidden {
+            let hidden_or_minimized = unsafe {
+                IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool()
+            };
+            if hidden_or_minimized {
+                unsafe { let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE); }
+                fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
+            }
+        }
         if !f.valid {
             // 窗口被 Explorer 销毁,重建
             let cfg = f.cfg.clone();
@@ -322,7 +504,7 @@ fn watchdog_tick(g: &mut Global) {
                 f.moving = false;
                 f.resizing = None;
                 if g.zen {
-                    unsafe { ShowWindow(hwnd, SW_HIDE); }
+                    unsafe { let _ = ShowWindow(hwnd, SW_HIDE); };
                 }
                 // watcher 仍挂在 f 上且按栅栏 id 通知,新窗口自动恢复实时刷新
                 fence::refresh_entries(f, &config::vault_dir(&g.config));
@@ -347,6 +529,46 @@ fn watchdog_tick(g: &mut Global) {
                 }
             }
         }
+    }
+    // Explorer 重启、用户刷新桌面或新图标出现后，再次维护禁放区。
+    reserve_desktop_icons(g);
+}
+
+/// 维护严格的“所有应用窗口 > 栅栏 > Explorer 桌面”层级。
+/// 栅栏永不使用 TOPMOST；Show Desktop 改写 Z 序后，也只把它插回桌面宿主正上方。
+fn desktop_layer_tick(g: &mut Global) {
+    if g.zen {
+        return;
+    }
+    let host_valid = g.desktop_host.is_some_and(|h| unsafe { IsWindow(Some(h)).as_bool() });
+    if !host_valid {
+        g.desktop_host = utils::find_desktop_host();
+    }
+    let Some(host) = g.desktop_host else { return };
+    let mut anchor = host;
+    for f in g
+        .fences
+        .iter()
+        .filter(|f| f.valid && download_box_should_show(g, f.cfg.id))
+    {
+        unsafe {
+            if IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool() {
+                let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+            }
+            let above = GetWindow(anchor, GW_HWNDPREV).unwrap_or(HWND_TOP);
+            if above != f.hwnd {
+                let _ = SetWindowPos(
+                    f.hwnd,
+                    Some(above),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+        anchor = f.hwnd;
     }
 }
 
@@ -382,7 +604,7 @@ pub fn handle_drop(hwnd: HWND, paths: Vec<String>) {
             }
         }
         if moved > 0 {
-            unsafe { PostMessageW(Some(hwnd), WM_APP_DROP, WPARAM(0), LPARAM(0)); }
+            unsafe { let _ = PostMessageW(Some(hwnd), WM_APP_DROP, WPARAM(0), LPARAM(0)); };
         }
         if failed > 0 {
             // 拖放失败静默是历史缺陷:至少给用户一个托盘气泡提示
@@ -404,6 +626,9 @@ fn ext_of(path: &Path) -> String {
 }
 
 pub fn sweep_desktop(g: &mut Global) {
+    if g.config.download_enabled {
+        ingest_desktop_events(g);
+    }
     let Some(dir) = desktop_dir() else { return };
     let rules = g.config.sweep_rules.clone();
     if rules.is_empty() {
@@ -413,6 +638,10 @@ pub fn sweep_desktop(g: &mut Global) {
     for e in rd.flatten() {
         let p = e.path();
         if !p.is_file() {
+            continue;
+        }
+        // 新下载优先进入下载收纳箱，不被扩展名清扫规则抢走。
+        if g.download_pending.contains_key(&p) {
             continue;
         }
         let ext = ext_of(&p);
@@ -426,6 +655,89 @@ pub fn sweep_desktop(g: &mut Global) {
             }
         }
     }
+}
+
+fn is_download_temp(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("crdownload" | "part" | "partial" | "download" | "tmp")
+    )
+}
+
+fn ingest_desktop_events(g: &mut Global) {
+    let Some(downloads) = downloads_dir() else { return };
+    while let Ok(names) = g.download_rx.try_recv() {
+        for name in names {
+            let path = downloads.join(name);
+            if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case("desktop.ini")) {
+                continue;
+            }
+            if path.is_file() && !is_download_temp(&path) && g.desktop_seen.insert(path.clone()) {
+                g.download_pending.insert(path, DownloadCandidate {
+                    len: u64::MAX,
+                    modified: None,
+                    stable_ticks: 0,
+                });
+            }
+        }
+    }
+    // 删除或已移动的路径不应永远占着 seen，允许日后同名下载再次被接管。
+    g.desktop_seen.retain(|p| p.exists());
+}
+
+fn download_target(g: &Global) -> PathBuf {
+    g.config
+        .download_box_id
+        .and_then(|id| g.fences.iter().find(|f| f.valid && f.cfg.id == id))
+        .and_then(|f| f.cfg.folder.clone())
+        .unwrap_or_else(config::download_box_dir)
+}
+
+fn download_tick(g: &mut Global) {
+    if !g.config.download_enabled {
+        while g.download_rx.try_recv().is_ok() {}
+        g.download_pending.clear();
+        return;
+    }
+    ingest_desktop_events(g);
+    let target = download_target(g);
+    let mut completed = Vec::new();
+    for (path, state) in g.download_pending.iter_mut() {
+        let Ok(meta) = std::fs::metadata(path) else {
+            completed.push(path.clone());
+            continue;
+        };
+        if !meta.is_file() {
+            completed.push(path.clone());
+            continue;
+        }
+        let modified = meta.modified().ok();
+        if state.len == meta.len() && state.modified == modified {
+            state.stable_ticks = state.stable_ticks.saturating_add(1);
+        } else {
+            state.len = meta.len();
+            state.modified = modified;
+            state.stable_ticks = 0;
+        }
+        // 连续约两秒无尺寸/时间变化后再移动，避免截断仍在写入的浏览器下载。
+        if state.stable_ticks >= 2 && watcher::move_to_dir(path, &target).is_ok() {
+            completed.push(path.clone());
+        }
+    }
+    if completed.is_empty() {
+        return;
+    }
+    for path in completed {
+        g.download_pending.remove(&path);
+        g.desktop_seen.remove(&path);
+    }
+    if let Some(id) = g.config.download_box_id {
+        if let Some(f) = g.fences.iter_mut().find(|f| f.valid && f.cfg.id == id) {
+            fence::refresh_entries(f, &config::vault_dir(&g.config));
+            fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
+        }
+    }
+    reserve_desktop_icons(g);
 }
 
 fn sweep_retry_tick(g: &mut Global) {
@@ -505,6 +817,8 @@ fn set_autostart(enabled: bool) {
 
 const TID_WATCHDOG: usize = 1;
 const TID_SWEEP_RETRY: usize = 3;
+const TID_DOWNLOADS: usize = 4;
+const TID_DESKTOP_LAYER: usize = 5;
 const WM_APP_SWEEP: u32 = WM_APP + 5;
 
 unsafe extern "system" fn msg_wndproc(
@@ -518,8 +832,26 @@ unsafe extern "system" fn msg_wndproc(
         if action == windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP as u32
             || action == windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU as u32
         {
-            let (zen, ghost, autostart) = with_global(|g| (g.zen, g.config.ghost_mode, g.config.autostart));
-            let cmd = show_tray_menu(hwnd, zen, ghost, autostart);
+            let (zen, ghost, autostart, download_enabled, download_visible, desktop_avoid) =
+                with_global(|g| {
+                    (
+                        g.zen,
+                        g.config.ghost_mode,
+                        g.config.autostart,
+                        g.config.download_enabled,
+                        g.config.download_box_visible,
+                        g.config.desktop_avoid,
+                    )
+                });
+            let cmd = show_tray_menu(
+                hwnd,
+                zen,
+                ghost,
+                autostart,
+                download_enabled,
+                download_visible,
+                desktop_avoid,
+            );
             dispatch_menu(cmd);
         } else if action == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK as u32 {
             with_global(|g| {
@@ -540,6 +872,8 @@ unsafe extern "system" fn msg_wndproc(
         match wparam.0 {
             TID_WATCHDOG => with_global(|g| watchdog_tick(g)),
             TID_SWEEP_RETRY => with_global(|g| sweep_retry_tick(g)),
+            TID_DOWNLOADS => with_global(|g| download_tick(g)),
+            TID_DESKTOP_LAYER => with_global(|g| desktop_layer_tick(g)),
             _ => {}
         }
         return LRESULT(0);
@@ -589,7 +923,7 @@ fn dispatch_menu(cmd: u32) {
                         w: (280.0 * s) as i32,
                         h: (340.0 * s) as i32,
                         dpi: (96.0 * s).round() as u32,
-                        opacity: 0.74,
+                        opacity: 0.7,
                         icon: 32,
                         pos_set: None,
                     };
@@ -634,7 +968,7 @@ fn dispatch_menu(cmd: u32) {
                         w: (260.0 * s) as i32,
                         h: (340.0 * s) as i32,
                         dpi: (96.0 * s).round() as u32,
-                        opacity: 0.74,
+                        opacity: 0.7,
                         icon: 32,
                         pos_set: None,
                     };
@@ -666,12 +1000,39 @@ fn dispatch_menu(cmd: u32) {
             });
         }
         MENU_SWEEP => {
-            unsafe { PostMessageW(
+            let _ = unsafe { PostMessageW(
                 Some(with_global(|g| g.msg_hwnd)),
                 WM_APP_SWEEP,
                 WPARAM(0),
                 LPARAM(0),
             ) };
+        }
+        MENU_DOWNLOAD_ENABLED => {
+            with_global(|g| set_download_enabled(g, !g.config.download_enabled));
+        }
+        MENU_DOWNLOAD_VISIBLE => {
+            with_global(|g| {
+                if g.config.download_enabled {
+                    set_download_box_visible(g, !g.config.download_box_visible);
+                }
+            });
+        }
+        MENU_DESKTOP_AVOID => {
+            with_global(|g| {
+                g.config.desktop_avoid = !g.config.desktop_avoid;
+                if g.config.desktop_avoid {
+                    reserve_desktop_icons(g);
+                } else {
+                    // 关闭避让:不回退图标(由「撤销并关闭避让」负责),
+                    // 只恢复自动排列样式并清空历史。
+                    desktop_icons::restore_autoarrange();
+                    desktop_icons::clear_history();
+                }
+                config::save(&g.config);
+            });
+        }
+        MENU_DESKTOP_ROLLBACK => {
+            with_global(|g| rollback_desktop(g));
         }
         MENU_AUTOSTART => {
             with_global(|g| {
@@ -685,17 +1046,20 @@ fn dispatch_menu(cmd: u32) {
                 let mut c = config::load();
                 config::normalize_dpi(&mut c);
                 g.config = c;
+                // 保留进程级监听（桌面清扫和 Downloads 接管）；先停止所有栅栏监听，
+                // 避免窗口销毁期间仍收到刷新。
+                g.watchers
+                    .retain(|watcher| watcher.owner == WatcherOwner::Process);
                 // 先销毁全部旧窗口(避免持借用调用 DestroyWindow)
                 let hwnds: Vec<HWND> = g.fences.iter().filter(|f| f.valid).map(|f| f.hwnd).collect();
                 for h in hwnds {
                     unsafe {
-                        windows::Win32::System::Ole::RevokeDragDrop(h);
-                        DestroyWindow(h);
+                        let _ = windows::Win32::System::Ole::RevokeDragDrop(h);
+                        let _ = DestroyWindow(h);
                     }
                 }
                 g.fences.clear(); // Fence 析构 → 各自目录监听自动停止
                 g.droptargets.clear();
-                g.watchers.clear(); // 桌面清扫监听随之停止
                 // 与启动恢复一致:重复/缺失 id 重新分配,保证按 id 刷新全部生效
                 let mut seen = std::collections::HashSet::new();
                 for cfg in g.config.fences.clone() {
@@ -706,6 +1070,7 @@ fn dispatch_menu(cmd: u32) {
                     }
                     create_fence(g, c);
                 }
+                ensure_download_box(g);
                 apply_visibility(g);
             });
         }
@@ -725,7 +1090,7 @@ fn dispatch_menu(cmd: u32) {
             }
         }
         MENU_EXIT => {
-            unsafe { PostMessageW(Some(with_global(|g| g.msg_hwnd)), WM_QUIT, WPARAM(0), LPARAM(0)); }
+            unsafe { let _ = PostMessageW(Some(with_global(|g| g.msg_hwnd)), WM_QUIT, WPARAM(0), LPARAM(0)); };
         }
         _ => {}
     }
@@ -806,7 +1171,9 @@ fn main() {
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            // 托盘弹出菜单需要一个可成为前台窗口的隐藏顶层 owner；
+            // HWND_MESSAGE 消息窗口无法可靠触发“点击外部关闭菜单”。
+            None,
             None,
             Some(hinst),
             None,
@@ -833,6 +1200,13 @@ fn main() {
     let vault = config::vault_dir(&cfg);
     let _ = std::fs::create_dir_all(&vault);
 
+    let (desktop_tx, desktop_rx) = mpsc::channel::<Vec<String>>();
+    let (download_tx, download_rx) = mpsc::channel::<Vec<String>>();
+    let desktop_seen = downloads_dir()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+
     G.set(Mutex::new(Global {
         config: cfg.clone(),
         next_id: cfg.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1,
@@ -842,6 +1216,10 @@ fn main() {
         desktop_host: None,
         icons: icons::IconCache::new(),
         sweep_retry: Vec::new(),
+        desktop_rx,
+        desktop_seen,
+        download_rx,
+        download_pending: HashMap::new(),
         exiting: false,
         droptargets: Vec::new(),
         watchers: Vec::new(),
@@ -867,6 +1245,18 @@ fn main() {
             Some(msg_hwnd),
             TID_WATCHDOG,
             3000,
+            None,
+        );
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+            Some(msg_hwnd),
+            TID_DOWNLOADS,
+            1000,
+            None,
+        );
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+            Some(msg_hwnd),
+            TID_DESKTOP_LAYER,
+            150,
             None,
         );
         let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
@@ -914,28 +1304,30 @@ fn main() {
                 sync_config(g);
             }
         }
+        // 始终保留专用下载收纳箱;是否接管/显示由两个独立配置控制。
+        ensure_download_box(g);
         // 网格落位:恢复后把所有栅栏吸附到整数槽位、clamp 进工作区,
         // 并推挤消除重叠 —— 重启后布局也保持规整
         let n = g.fences.len();
         for i in 0..n {
             fence::settle_fence(g, i);
         }
+        apply_visibility(g);
         // 桌面自动归类监听:线程里只做扩展名粗筛,命中就通知主线程执行整理
         if let Some(dir) = desktop_dir() {
             let rules = g.config.sweep_rules.clone();
             let mhwnd = g.msg_hwnd.0 as usize;
+            let tx = desktop_tx.clone();
             let watcher = watcher::spawn_dir_watcher(dir.clone(), move |names| {
-                if rules.is_empty() {
-                    return;
-                }
-                for n in names {
+                let _ = tx.send(names.clone());
+                for n in &names {
                     let ext = Path::new(&n)
                         .extension()
                         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
                         .unwrap_or_default();
                     if rules.iter().any(|r| r.ext.to_lowercase() == ext) {
                         unsafe {
-                            PostMessageW(
+                            let _ = PostMessageW(
                                 Some(HWND(mhwnd as *mut c_void)),
                                 WM_APP_SWEEP,
                                 WPARAM(0),
@@ -946,8 +1338,17 @@ fn main() {
                     }
                 }
             });
-            g.watchers.push(watcher);
+            g.watchers.push(ManagedWatcher::process(watcher));
         }
+        // 下载收纳箱：单独监听 Downloads 目录，避免把桌面所有文件都当下载。
+        if let Some(dir) = downloads_dir() {
+            let tx = download_tx.clone();
+            let watcher = watcher::spawn_dir_watcher(dir, move |names| {
+                let _ = tx.send(names.clone());
+            });
+            g.watchers.push(ManagedWatcher::process(watcher));
+        }
+        reserve_desktop_icons(g);
     });
 
     dlog(&format!("[main] started, fences: {}", fences.len()));
@@ -962,7 +1363,7 @@ fn main() {
             count += 1;
             if count % 2000 == 0 {
                 let hw = msg.hwnd;
-                let cls = unsafe {
+                let cls = {
                     let mut b = [0u16; 64];
                     windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hw, &mut b);
                     String::from_utf16_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(64)])
@@ -976,7 +1377,7 @@ fn main() {
                 ));
                 last = std::time::Instant::now();
             }
-            TranslateMessage(&msg);
+            let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
@@ -984,19 +1385,21 @@ fn main() {
     // 清理
     with_global(|g| {
         g.exiting = true;
+        // 先停止所有目录监听，确保清理窗口和 COM/GDI+ 后不再有后台通知。
+        g.watchers.clear();
         config::save(&g.config);
         for f in g.fences.iter() {
             if f.valid {
-                unsafe { windows::Win32::System::Ole::RevokeDragDrop(f.hwnd); }
+                unsafe { let _ = windows::Win32::System::Ole::RevokeDragDrop(f.hwnd); };
             }
         }
     });
     unsafe {
         remove_tray(msg_hwnd);
-        DestroyWindow(msg_hwnd);
+        let _ = DestroyWindow(msg_hwnd);
         GdiplusShutdown(token);
         OleUninitialize();
-        CloseHandle(mutex);
+        let _ = CloseHandle(mutex);
     }
     eprintln!("[feather] bye");
 }

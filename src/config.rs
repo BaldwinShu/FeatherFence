@@ -28,11 +28,15 @@ pub struct FenceCfg {
 }
 
 fn default_opacity() -> f32 {
-    0.74
+    0.7
 }
 
 fn default_icon() -> u32 {
     32
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for FenceCfg {
@@ -72,6 +76,15 @@ pub struct Config {
     pub autostart: bool,
     #[serde(default)]
     pub vault_dir: Option<PathBuf>,
+    /// 专用“下载收纳箱”的栅栏 id。程序只接管启动后新出现在桌面的文件。
+    #[serde(default)]
+    pub download_box_id: Option<u32>,
+    /// 是否接管程序运行后新出现在桌面的下载文件。
+    #[serde(default = "default_true")]
+    pub download_enabled: bool,
+    /// 下载接管开启时，是否显示专用收纳箱窗口。
+    #[serde(default = "default_true")]
+    pub download_box_visible: bool,
     /// 全局图标尺寸(逻辑像素,默认 32)
     #[serde(default = "default_icon")]
     pub icon: u32,
@@ -79,6 +92,10 @@ pub struct Config {
     /// - 缺省/1:旧版物理 x/y/w/h,未记录 DPI
     /// - 2:逻辑 x/y/w/h,启动时统一乘系统 DPI
     /// - 3:物理 x/y/w/h + 每栅栏保存时 DPI
+    /// 桌面图标避让:开启后栅栏覆盖的区域作为禁放区,把被盖住的桌面图标
+    /// 就近搬到空闲网格(默认关闭;开启会关闭 Explorer 的自动排列)。
+    #[serde(default)]
+    pub desktop_avoid: bool,
     #[serde(default)]
     pub version: u32,
 }
@@ -91,7 +108,11 @@ impl Default for Config {
             ghost_mode: false,
             autostart: false,
             vault_dir: None,
+            download_box_id: None,
+            download_enabled: true,
+            download_box_visible: true,
             icon: default_icon(),
+            desktop_avoid: false,
             version: 3,
         }
     }
@@ -199,6 +220,13 @@ mod dpi_tests {
         assert_eq!(back.fences[0].pos_set, Some(true));
         assert_eq!(back.fences[0].x, 0);
     }
+
+    #[test]
+    fn legacy_config_keeps_download_capture_enabled_and_visible() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(c.download_enabled);
+        assert!(c.download_box_visible);
+    }
 }
 
 pub fn config_dir() -> PathBuf {
@@ -214,6 +242,10 @@ pub fn config_path() -> PathBuf {
 
 pub fn default_vault_dir() -> PathBuf {
     config_dir().join("vault")
+}
+
+pub fn download_box_dir() -> PathBuf {
+    config_dir().join("boxes").join("下载收纳箱")
 }
 
 pub fn vault_dir(c: &Config) -> PathBuf {

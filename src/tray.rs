@@ -2,14 +2,15 @@
 use std::mem::{size_of, zeroed};
 
 use windows::core::{w, BOOL, PCWSTR};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, HICON, ICONINFO,
-    MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TrackPopupMenu, TPM_NONOTIFY, TPM_RETURNCMD,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, PostMessageW,
+    SetForegroundWindow, HICON, ICONINFO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, TrackPopupMenu, TPM_NONOTIFY, TPM_RETURNCMD, WM_NULL,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -32,6 +33,10 @@ pub const MENU_AUTOSTART: u32 = 2007;
 pub const MENU_CONFIG_DIR: u32 = 2008;
 pub const MENU_EXIT: u32 = 2009;
 pub const MENU_RELOAD: u32 = 2010;
+pub const MENU_DOWNLOAD_ENABLED: u32 = 2011;
+pub const MENU_DOWNLOAD_VISIBLE: u32 = 2012;
+pub const MENU_DESKTOP_AVOID: u32 = 2013;
+pub const MENU_DESKTOP_ROLLBACK: u32 = 2014;
 
 pub fn make_tray_icon() -> HICON {
     // 16x16 三横条"栅栏"图标,带 alpha
@@ -71,9 +76,9 @@ pub fn make_tray_icon() -> HICON {
             hbmColor: hbmp,
         };
         let hicon = CreateIconIndirect(&ii).unwrap_or_default();
-        DeleteObject(HGDIOBJ(hbmp.0));
-        DeleteObject(HGDIOBJ(mask.0));
-        DeleteDC(dc);
+        let _ = DeleteObject(HGDIOBJ(hbmp.0));
+        let _ = DeleteObject(HGDIOBJ(mask.0));
+        let _ = DeleteDC(dc);
         hicon
     }
 }
@@ -96,7 +101,7 @@ pub fn add_tray(hwnd: HWND, hicon: HICON) {
         nid.uCallbackMessage = WM_APP_TRAY;
         nid.hIcon = hicon;
         set_tip(&mut nid, "轻栅栏 Feather Fences");
-        Shell_NotifyIconW(NIM_ADD, &nid);
+        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
     }
 }
 
@@ -106,7 +111,7 @@ pub fn remove_tray(hwnd: HWND) {
         nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
         nid.uID = TRAY_ID;
-        Shell_NotifyIconW(NIM_DELETE, &nid);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
     }
 }
 
@@ -135,40 +140,74 @@ pub fn notify_tip(hwnd: HWND, title: &str, msg: &str) {
 }
 
 /// 弹出托盘菜单,返回用户选择的命令 ID(0 = 无)
-pub fn show_tray_menu(hwnd: HWND, zen: bool, ghost: bool, autostart: bool) -> u32 {
+pub fn show_tray_menu(
+    hwnd: HWND,
+    zen: bool,
+    ghost: bool,
+    autostart: bool,
+    download_enabled: bool,
+    download_visible: bool,
+    desktop_avoid: bool,
+) -> u32 {
     unsafe {
         let menu = CreatePopupMenu().unwrap_or_default();
-        AppendMenuW(menu, MF_STRING, MENU_NEW_PORTAL as usize, PCWSTR(w!("新建文件夹栅栏…").as_ptr()));
-        AppendMenuW(menu, MF_STRING, MENU_NEW_BOX as usize, PCWSTR(w!("新建收纳栅栏").as_ptr()));
-        AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        AppendMenuW(menu, MF_STRING, MENU_TOGGLE_VIS as usize, PCWSTR(w!("隐藏/显示全部栅栏").as_ptr()));
-        AppendMenuW(
+        let _ = AppendMenuW(menu, MF_STRING, MENU_NEW_PORTAL as usize, PCWSTR(w!("新建文件夹栅栏…").as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_NEW_BOX as usize, PCWSTR(w!("新建收纳栅栏").as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_VIS as usize, PCWSTR(w!("隐藏/显示全部栅栏").as_ptr()));
+        let _ = AppendMenuW(
             menu,
             if zen { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
             MENU_ZEN as usize,
             PCWSTR(w!("Zen 模式\tCtrl+Alt+Z").as_ptr()),
         );
-        AppendMenuW(
+        let _ = AppendMenuW(
             menu,
             if ghost { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
             MENU_GHOST as usize,
             PCWSTR(w!("Ghost 模式(悬停显现)").as_ptr()),
         );
-        AppendMenuW(menu, MF_STRING, MENU_SWEEP as usize, PCWSTR(w!("立即整理桌面").as_ptr()));
-        AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        AppendMenuW(
+        let _ = AppendMenuW(menu, MF_STRING, MENU_SWEEP as usize, PCWSTR(w!("立即整理桌面").as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(
+            menu,
+            if download_enabled { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
+            MENU_DOWNLOAD_ENABLED as usize,
+            PCWSTR(w!("下载接管").as_ptr()),
+        );
+        let visible_flags = if download_visible { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED };
+        let _ = AppendMenuW(
+            menu,
+            if download_enabled { visible_flags } else { visible_flags | MF_GRAYED },
+            MENU_DOWNLOAD_VISIBLE as usize,
+            PCWSTR(w!("显示下载收纳箱").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            if desktop_avoid { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
+            MENU_DESKTOP_AVOID as usize,
+            PCWSTR(w!("桌面图标避让").as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_STRING, MENU_DESKTOP_ROLLBACK as usize, PCWSTR(w!("撤销并关闭避让").as_ptr()));
+        let _ = AppendMenuW(menu, MF_GRAYED, 0, PCWSTR(w!("搬移后 1 分钟内可撤销").as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(
             menu,
             if autostart { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
             MENU_AUTOSTART as usize,
             PCWSTR(w!("开机自启").as_ptr()),
         );
-        AppendMenuW(menu, MF_STRING, MENU_RELOAD as usize, PCWSTR(w!("重新加载配置").as_ptr()));
-        AppendMenuW(menu, MF_STRING, MENU_CONFIG_DIR as usize, PCWSTR(w!("打开配置目录").as_ptr()));
-        AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        AppendMenuW(menu, MF_STRING, MENU_EXIT as usize, PCWSTR(w!("退出").as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_RELOAD as usize, PCWSTR(w!("重新加载配置").as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_CONFIG_DIR as usize, PCWSTR(w!("打开配置目录").as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT as usize, PCWSTR(w!("退出").as_ptr()));
 
         let mut pt = windows::Win32::Foundation::POINT::default();
-        windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+
+        // 托盘菜单必须由一个前台顶层窗口拥有，否则 Windows 不会可靠地在用户
+        // 点击菜单外部时结束 TrackPopupMenu（菜单会一直留在屏幕上）。
+        let _ = SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_NONOTIFY,
@@ -178,7 +217,10 @@ pub fn show_tray_menu(hwnd: HWND, zen: bool, ghost: bool, autostart: bool) -> u3
             hwnd,
             None,
         );
-        DestroyMenu(menu);
+        // 按照 Win32 托盘菜单约定，在 TrackPopupMenu 返回后投递一条消息，
+        // 确保系统完成菜单的关闭与前台切换。
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
         cmd.0 as u32
     }
 }
