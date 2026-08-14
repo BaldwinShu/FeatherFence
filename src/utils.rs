@@ -69,6 +69,41 @@ pub fn work_area(hwnd: HWND) -> RECT {
 static mut FOUND_HOST: Option<HWND> = None;
 static SPIF_SENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// 桌面层宿主查找:优先 Progman(桌面最底),其次 WorkerW。
+/// 纯枚举,不发 0x052C(Progman 无响应时会卡死主线程)。
+unsafe extern "system" fn enum_host_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(hwnd, &mut cls);
+    if n > 0 {
+        let name = String::from_utf16_lossy(&cls[..n as usize]);
+        match name.as_str() {
+            // 枚举顺序是 Z 序从上到下,Progman 在最底:遇到即停
+            "Progman" => {
+                unsafe { FOUND_HOST = Some(hwnd) };
+                return BOOL(0);
+            }
+            // WorkerW 兜底:只记第一个(未找到 Progman 时)
+            "WorkerW" if (unsafe { FOUND_HOST }).is_none() => {
+                unsafe { FOUND_HOST = Some(hwnd) };
+            }
+            _ => {}
+        }
+    }
+    BOOL(1)
+}
+
+/// 桌面宿主窗口(Progman 优先,WorkerW 兜底)。
+/// 栅栏插到它之后 = 桌面背景之上、图标层/普通窗口之下。
+/// 注意:不能用 HWND_BOTTOM —— 实测会把窗口压到 Progman 之下的
+/// DWM 隐藏区域,窗口不可见且 FindWindow/EnumWindows 都枚举不到。
+pub fn desktop_insert_host() -> Option<HWND> {
+    unsafe {
+        FOUND_HOST = None;
+        let _ = EnumWindows(Some(enum_host_proc), LPARAM(0));
+        FOUND_HOST
+    }
+}
+
 unsafe extern "system" fn enum_child_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
     let mut cls = [0u16; 64];
     let n = GetClassNameW(hwnd, &mut cls);

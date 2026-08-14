@@ -1,10 +1,12 @@
 // 目录监听:ReadDirectoryChangesW,文件夹门户实时刷新 + 桌面自动归类
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
     FILE_ACTION_RENAMED_NEW_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
@@ -15,20 +17,57 @@ use windows::Win32::Storage::FileSystem::{
 use crate::utils::wstr;
 
 pub struct DirWatcher {
-    pub thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<()>>,
+    /// 停止信号:置位后线程尽快退出
+    stop: Arc<AtomicBool>,
+    /// 线程当前持有的目录句柄(裸指针以 usize 存储,避免 Send 问题);
+    /// stop() 关闭它以唤醒阻塞中的 ReadDirectoryChangesW
+    handle: Arc<Mutex<Option<usize>>>,
+}
+
+impl DirWatcher {
+    /// 请求停止:置位信号并关闭目录句柄(阻塞读立即返回错误,线程随之退出)。
+    /// 句柄由"谁从共享槽取走谁关闭"保证不重复关闭。
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.lock().unwrap().take() {
+            unsafe { let _ = CloseHandle(HANDLE(h as *mut c_void)); }
+        }
+    }
+}
+
+impl Drop for DirWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 pub fn spawn_dir_watcher<F>(dir: PathBuf, notify: F) -> DirWatcher
 where
     F: Fn(Vec<String>) + Send + 'static,
 {
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+    let t_stop = stop.clone();
+    let t_handle = handle.clone();
     let thread = std::thread::spawn(move || {
-        let mut handle: Option<HANDLE> = None;
+        let mut local: Option<HANDLE> = None;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            if handle.is_none() {
+            // 停止检查:退出前把句柄从共享槽取走关闭(若 stop() 已取走则无需再关)
+            if t_stop.load(Ordering::SeqCst) {
+                if let Some(h) = local.take() {
+                    let mut sh = t_handle.lock().unwrap();
+                    if *sh == Some(h.0 as usize) {
+                        *sh = None;
+                        unsafe { let _ = CloseHandle(h); }
+                    }
+                }
+                break;
+            }
+            if local.is_none() {
                 let wdir = wstr(&dir.to_string_lossy());
-                handle = unsafe {
+                local = unsafe {
                     CreateFileW(
                         PCWSTR(wdir.as_ptr()),
                         FILE_LIST_DIRECTORY.0,
@@ -40,12 +79,18 @@ where
                     )
                     .ok()
                 };
-                if handle.is_none() {
-                    std::thread::sleep(std::time::Duration::from_secs(3));
-                    continue;
+                match local {
+                    Some(h) => *t_handle.lock().unwrap() = Some(h.0 as usize),
+                    None => {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        continue;
+                    }
                 }
+                // 重新进入循环顶部:补查 stop,避免"打开句柄后 stop() 才置位"时
+                // 线程带着无人关闭的新句柄阻塞在读上
+                continue;
             }
-            let h = handle.unwrap();
+            let h = local.unwrap();
             let mut returned: u32 = 0;
             let ok = unsafe {
                 ReadDirectoryChangesW(
@@ -60,9 +105,13 @@ where
                 )
             };
             if ok.is_err() || returned == 0 {
-                // 目录失效,关掉重来
-                unsafe { let _ = windows::Win32::Foundation::CloseHandle(h); }
-                handle = None;
+                // 目录失效,或 stop() 已关闭句柄:归还共享槽并关闭(取走者负责关闭)
+                let mut sh = t_handle.lock().unwrap();
+                if *sh == Some(h.0 as usize) {
+                    *sh = None;
+                    unsafe { let _ = CloseHandle(h); }
+                }
+                local = None;
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 continue;
             }
@@ -92,7 +141,11 @@ where
             }
         }
     });
-    DirWatcher { thread: Some(thread) }
+    DirWatcher {
+        thread: Some(thread),
+        stop,
+        handle,
+    }
 }
 
 /// 移动文件到目标目录(同卷 rename,跨卷 copy+delete),自动避免重名

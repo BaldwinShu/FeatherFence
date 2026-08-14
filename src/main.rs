@@ -36,16 +36,16 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowRect,
-    HWND_MESSAGE, PostMessageW, PostQuitMessage, RegisterClassW, SetParent, SetWindowPos, ShowWindow,
-    TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW, WNDPROC,
-    WS_POPUP, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
+    HWND_MESSAGE, PostMessageW, PostQuitMessage, RegisterClassW, SetParent, SetWindowPos,
+    ShowWindow, TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW,
+    WNDPROC, WS_POPUP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
 };
 use windows::Win32::System::Ole::RegisterDragDrop;
 
 use config::{Config, FenceCfg};
-use fence::{Fence, WM_APP_DROP, WM_APP_REFRESH};
+use fence::{Fence, WM_APP_DROP};
 use tray::{
-    TRAY_ID, WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX,
+    WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX,
     MENU_NEW_PORTAL, MENU_RELOAD, MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, add_tray, make_tray_icon,
     remove_tray, show_tray_menu,
 };
@@ -65,7 +65,7 @@ pub struct Global {
     pub exiting: bool,
     /// 拖放 COM 对象,保持存活
     pub droptargets: Vec<windows::Win32::System::Ole::IDropTarget>,
-    /// 目录监听线程
+    /// 桌面自动归类目录监听(栅栏自身的 watcher 随 Fence 存放,删除/重载自动停止)
     pub watchers: Vec<watcher::DirWatcher>,
 }
 
@@ -130,9 +130,11 @@ pub fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
         cfg.id = g.next_id;
         g.next_id += 1;
     }
-    // 默认位置:屏幕右上角级联(按系统 DPI 缩放逻辑像素偏移;创建窗口前无 hwnd)
+    // 默认位置:屏幕右上角级联(按系统 DPI 缩放逻辑像素偏移;创建窗口前无 hwnd)。
+    // 判定"未放置"用 pos_set:旧配置缺字段且 x/y 恰为 (0,0) 时视为未放置;
+    // 本版本保存过的位置(含真正的 (0,0))一律原样恢复。
     let ms = fence::dpi_scale();
-    if cfg.x == 0 && cfg.y == 0 {
+    if cfg.pos_set != Some(true) && cfg.x == 0 && cfg.y == 0 {
         let (sw, sh) = utils::screen_size();
         let n = g.fences.len();
         cfg.x = (sw - (320.0 * ms) as i32 - (20.0 * ms) as i32 - (n as i32 % 5) * (30.0 * ms) as i32).max(0);
@@ -235,29 +237,31 @@ pub fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     f.cfg.w = (final_rect.right - final_rect.left).max(1);
     f.cfg.h = (final_rect.bottom - final_rect.top).max(1);
     f.cfg.dpi = (f.dpi * 96.0).round() as u32;
+    f.cfg.pos_set = Some(true); // 位置已确定(含恰好 (0,0) 的情况)
     fence::refresh_entries(&mut f, &config::vault_dir(&g.config));
     fence::render_fence(&mut g.icons, g.config.ghost_mode, &mut f);
+    // 目录监听(所有栅栏):文件夹栅栏监听门户目录,收纳栅栏监听收纳箱目录。
+    // 通知按栅栏 id 发给消息窗口——不持有具体 hwnd,窗口被 Explorer 销毁重建后
+    // watcher 无需重绑仍能按 id 找到新窗口;watcher 随 Fence 析构自动停止。
+    let watch_dir = f.cfg.folder.clone().unwrap_or_else(|| config::vault_dir(&g.config));
+    let fid = f.cfg.id;
+    let mhwnd = g.msg_hwnd.0 as usize;
+    let watcher = watcher::spawn_dir_watcher(watch_dir, move |_names| {
+        unsafe {
+            PostMessageW(
+                Some(HWND(mhwnd as *mut c_void)),
+                fence::WM_APP_REFRESH_ID,
+                WPARAM(fid as usize),
+                LPARAM(0),
+            );
+        }
+    });
+    f.watcher = Some(watcher);
     let id = f.cfg.id;
     g.fences.push(f);
     // 新栅栏立即落到网格:尺寸/位置吸附 + clamp 工作区 + 消除重叠
     let new_idx = g.fences.len() - 1;
     fence::settle_fence(g, new_idx);
-
-    // 门户目录监听
-    if let Some(folder) = g.fences.last().and_then(|f| f.cfg.folder.clone()) {
-        let hwnd2 = hwnd.0 as usize;
-        let watcher = watcher::spawn_dir_watcher(folder, move |_names| {
-            unsafe {
-                PostMessageW(
-                    Some(HWND(hwnd2 as *mut c_void)),
-                    WM_APP_REFRESH,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-            }
-        });
-        g.watchers.push(watcher);
-    }
     sync_config(g);
     id
 }
@@ -271,6 +275,7 @@ pub fn delete_fence(g: &mut Global, idx: usize) {
         windows::Win32::System::Ole::RevokeDragDrop(f.hwnd);
         DestroyWindow(f.hwnd);
     }
+    // Fence 析构 → 其目录监听 watcher 自动 stop(线程退出,不再向死窗口投递消息)
     g.fences.remove(idx);
     sync_config(g);
 }
@@ -305,8 +310,8 @@ fn watchdog_tick(g: &mut Global) {
             // 窗口被 Explorer 销毁,重建
             let cfg = f.cfg.clone();
             // 不挂 Progman(分层窗口+高 alpha+Progman 父窗口会触发 DWM 命中测试 bug,
-    // 导致窗口可见但点不到拖不动);改为独立顶层窗口 + 压底 Z 序(同 Fluid Fences 思路)
-    let hwnd = fence::create_window(&cfg, None);
+            // 导致窗口可见但点不到拖不动);改为独立顶层窗口 + 压底 Z 序(同 Fluid Fences 思路)
+            let hwnd = fence::create_window(&cfg, None);
             if !hwnd.is_invalid() {
                 let dt = droptarget::FenceDropTarget::new(hwnd);
                 let it: windows::Win32::System::Ole::IDropTarget = dt.into();
@@ -319,8 +324,27 @@ fn watchdog_tick(g: &mut Global) {
                 if g.zen {
                     unsafe { ShowWindow(hwnd, SW_HIDE); }
                 }
+                // watcher 仍挂在 f 上且按栅栏 id 通知,新窗口自动恢复实时刷新
                 fence::refresh_entries(f, &config::vault_dir(&g.config));
                 fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
+            }
+        }
+        // 周期回位:任何原因把栅栏从桌面层顶起时,3s 内插回桌面层之上。
+        // 用 desktop_insert_host(Progman 之后)而非 HWND_BOTTOM ——
+        // HWND_BOTTOM 会把窗口压进 Progman 之下的 DWM 隐藏区域(不可见)。
+        if f.valid {
+            if let Some(host) = utils::desktop_insert_host() {
+                unsafe {
+                    let _ = SetWindowPos(
+                        f.hwnd,
+                        Some(host),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
             }
         }
     }
@@ -339,6 +363,7 @@ pub fn handle_drop(hwnd: HWND, paths: Vec<String>) {
         });
         let Some(target) = target else { return };
         let mut moved = 0usize;
+        let mut failed = 0usize;
         for p in &paths {
             let src = PathBuf::from(p);
             if !src.exists() {
@@ -350,11 +375,22 @@ pub fn handle_drop(hwnd: HWND, paths: Vec<String>) {
             }
             match watcher::move_to_dir(&src, &target) {
                 Ok(_) => moved += 1,
-                Err(e) => eprintln!("[feather] move {p} -> {} failed: {e}", target.display()),
+                Err(e) => {
+                    eprintln!("[feather] move {p} -> {} failed: {e}", target.display());
+                    failed += 1;
+                }
             }
         }
         if moved > 0 {
             unsafe { PostMessageW(Some(hwnd), WM_APP_DROP, WPARAM(0), LPARAM(0)); }
+        }
+        if failed > 0 {
+            // 拖放失败静默是历史缺陷:至少给用户一个托盘气泡提示
+            tray::notify_tip(
+                g.msg_hwnd,
+                "轻栅栏",
+                &format!("{failed} 个文件未能移入目标目录(可能被占用或跨卷移动文件夹)"),
+            );
         }
     });
 }
@@ -512,6 +548,19 @@ unsafe extern "system" fn msg_wndproc(
         with_global(|g| sweep_desktop(g));
         return LRESULT(0);
     }
+    // 目录监听按栅栏 id 通知:窗口重建后依然有效(不依赖具体 hwnd)
+    if msg == fence::WM_APP_REFRESH_ID {
+        let id = wparam.0 as u32;
+        with_global(|g| {
+            if let Some(idx) = g.fences.iter().position(|f| f.valid && f.cfg.id == id) {
+                let ghost = g.config.ghost_mode;
+                let f = &mut g.fences[idx];
+                fence::refresh_entries(f, &config::vault_dir(&g.config));
+                fence::render_fence(&mut g.icons, ghost, f);
+            }
+        });
+        return LRESULT(0);
+    }
     if msg == WM_DESTROY {
         PostQuitMessage(0);
         return LRESULT(0);
@@ -530,8 +579,9 @@ fn dispatch_menu(cmd: u32) {
                         .unwrap_or_else(|| "文件夹栅栏".into());
                     let (sw, _sh) = utils::screen_size();
                     let s = fence::dpi_scale();
+                    // id 传 0,由 create_fence 统一分配并递增 next_id(避免重复 id)
                     let cfg = FenceCfg {
-                        id: g.next_id,
+                        id: 0,
                         title,
                         folder: Some(folder),
                         x: sw - (340.0 * s) as i32,
@@ -541,6 +591,7 @@ fn dispatch_menu(cmd: u32) {
                         dpi: (96.0 * s).round() as u32,
                         opacity: 0.74,
                         icon: 32,
+                        pos_set: None,
                     };
                     create_fence(g, cfg);
                 }
@@ -585,6 +636,7 @@ fn dispatch_menu(cmd: u32) {
                         dpi: (96.0 * s).round() as u32,
                         opacity: 0.74,
                         icon: 32,
+                        pos_set: None,
                     };
                     create_fence(g, cfg);
                 }
@@ -641,11 +693,18 @@ fn dispatch_menu(cmd: u32) {
                         DestroyWindow(h);
                     }
                 }
-                g.fences.clear();
+                g.fences.clear(); // Fence 析构 → 各自目录监听自动停止
                 g.droptargets.clear();
-                g.watchers.clear();
+                g.watchers.clear(); // 桌面清扫监听随之停止
+                // 与启动恢复一致:重复/缺失 id 重新分配,保证按 id 刷新全部生效
+                let mut seen = std::collections::HashSet::new();
                 for cfg in g.config.fences.clone() {
-                    create_fence(g, cfg);
+                    let mut c = cfg;
+                    if c.id == 0 || !seen.insert(c.id) {
+                        c.id = g.next_id;
+                        g.next_id += 1;
+                    }
+                    create_fence(g, c);
                 }
                 apply_visibility(g);
             });
@@ -822,15 +881,23 @@ fn main() {
     let fences = cfg.fences.clone();
     dlog(&format!("[main] restoring {} fences", fences.len()));
     with_global(|g| {
+        // 旧版 bug 曾产生重复 id(如多个文件夹栅栏 id 全为 1);按 id 通知的
+        // watcher 只命中第一个,其余栅栏失去自动刷新 —— 恢复时重新分配唯一 id
+        let mut seen = std::collections::HashSet::new();
         for fcfg in &fences {
-            create_fence(g, fcfg.clone());
+            let mut c = fcfg.clone();
+            if c.id == 0 || !seen.insert(c.id) {
+                c.id = g.next_id;
+                g.next_id += 1;
+            }
+            create_fence(g, c);
         }
         // 首启:没有栅栏就建一个默认收纳箱(右侧),并保存配置
         if g.fences.is_empty() {
             let (sw, _sh) = utils::screen_size();
             let s = fence::dpi_scale();
             let box_cfg = FenceCfg {
-                id: g.next_id,
+                id: 0, // 由 create_fence 分配;直接传 next_id 不会递增,会与后续新建栅栏撞 id
                 title: "收纳箱".into(),
                 folder: None,
                 x: sw - (320.0 * s) as i32,
@@ -840,6 +907,7 @@ fn main() {
                 dpi: (96.0 * s).round() as u32,
                 opacity: 0.74,
                 icon: 32,
+                pos_set: None,
             };
             // 创建成功才保存,避免失败时把配置覆盖成空
             if create_fence(g, box_cfg) != 0 {
