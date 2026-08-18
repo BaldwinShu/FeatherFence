@@ -250,6 +250,11 @@ mod dpi_tests {
 }
 
 pub fn config_dir() -> PathBuf {
+    if crate::perf::enabled() {
+        if let Some(path) = std::env::var_os("FEATHER_PERF_CONFIG_DIR") {
+            return PathBuf::from(path);
+        }
+    }
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
