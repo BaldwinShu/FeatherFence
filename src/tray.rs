@@ -12,7 +12,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, HICON, ICONINFO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
     MF_UNCHECKED, TrackPopupMenu, TPM_NONOTIFY, TPM_RETURNCMD, WM_NULL,
 };
-use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW};
+use windows::Win32::UI::Shell::{
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW, Shell_NotifyIconW,
+};
 
 use crate::utils::wstr;
 
@@ -109,6 +112,30 @@ pub fn remove_tray(hwnd: HWND) {
         nid.hWnd = hwnd;
         nid.uID = TRAY_ID;
         let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
+
+/// 托盘气泡通知(移入失败等一次性提示)
+pub fn notify_tip(hwnd: HWND, title: &str, msg: &str) {
+    unsafe {
+        let mut nid: NOTIFYICONDATAW = zeroed();
+        nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = TRAY_ID;
+        nid.uFlags = NIF_INFO;
+        nid.dwInfoFlags = NIIF_INFO;
+        nid.Anonymous.uTimeout = 4000;
+        let tw = wstr(title);
+        for (i, c) in tw.iter().take(63).enumerate() {
+            nid.szInfoTitle[i] = *c;
+        }
+        nid.szInfoTitle[63] = 0;
+        let mw = wstr(msg);
+        for (i, c) in mw.iter().take(255).enumerate() {
+            nid.szInfo[i] = *c;
+        }
+        nid.szInfo[255] = 0;
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 }
 

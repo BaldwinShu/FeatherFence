@@ -10,9 +10,10 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
-    FILE_ACTION_RENAMED_NEW_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
-    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 use windows::Win32::System::IO::CancelSynchronousIo;
 
@@ -188,7 +189,9 @@ fn parse_notify_names(buf: &[u8], returned: usize) -> Vec<String> {
             break;
         }
         if action == FILE_ACTION_ADDED.0
+            || action == FILE_ACTION_REMOVED.0
             || action == FILE_ACTION_MODIFIED.0
+            || action == FILE_ACTION_RENAMED_OLD_NAME.0
             || action == FILE_ACTION_RENAMED_NEW_NAME.0
         {
             let name_u16: Vec<u16> = buf[off + HEADER_LEN..name_end]
@@ -215,19 +218,46 @@ mod tests {
     use super::spawn_dir_watcher;
     use std::sync::mpsc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use windows::Win32::Storage::FileSystem::FILE_ACTION_RENAMED_NEW_NAME;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
+    };
 
-    #[test]
-    fn parses_single_unpadded_final_record() {
-        let name: Vec<u16> = "Notion-7.29.0.msix".encode_utf16().collect();
+    fn notify_record(action: u32, name: &str) -> Vec<u8> {
+        let name: Vec<u16> = name.encode_utf16().collect();
         let mut record = Vec::new();
         record.extend_from_slice(&0u32.to_le_bytes());
-        record.extend_from_slice(&FILE_ACTION_RENAMED_NEW_NAME.0.to_le_bytes());
+        record.extend_from_slice(&action.to_le_bytes());
         record.extend_from_slice(&((name.len() * 2) as u32).to_le_bytes());
         for ch in name {
             record.extend_from_slice(&ch.to_le_bytes());
         }
-        assert_eq!(parse_notify_names(&record, record.len()), ["Notion-7.29.0.msix"]);
+        record
+    }
+
+    #[test]
+    fn parses_single_unpadded_final_record() {
+        let record = notify_record(FILE_ACTION_RENAMED_NEW_NAME.0, "Notion-7.29.0.msix");
+        assert_eq!(
+            parse_notify_names(&record, record.len()),
+            ["Notion-7.29.0.msix"]
+        );
+    }
+
+    #[test]
+    fn parses_removed_name() {
+        let record = notify_record(FILE_ACTION_REMOVED.0, "~$设备报警.xlsx");
+
+        assert_eq!(
+            parse_notify_names(&record, record.len()),
+            ["~$设备报警.xlsx"]
+        );
+    }
+
+    #[test]
+    fn parses_renamed_old_name() {
+        let record = notify_record(FILE_ACTION_RENAMED_OLD_NAME.0, "before.txt");
+
+        assert_eq!(parse_notify_names(&record, record.len()), ["before.txt"]);
     }
 
     #[test]
@@ -267,6 +297,56 @@ mod tests {
         std::fs::write(dir.join("second.txt"), b"second").unwrap();
         assert!(rx.recv_timeout(Duration::from_millis(250)).is_err());
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn watcher_reports_removed_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "feather-fences-watcher-remove-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = spawn_dir_watcher(dir.clone(), move |names| {
+            let _ = tx.send(names);
+        });
+
+        let mut created = None;
+        for attempt in 0..30 {
+            let name = format!("remove-{attempt}.txt");
+            std::fs::write(dir.join(&name), b"temporary").unwrap();
+            if let Ok(names) = rx.recv_timeout(Duration::from_millis(100)) {
+                if names.iter().any(|seen| seen == &name) {
+                    created = Some(name);
+                    break;
+                }
+            }
+        }
+        let name = created.expect("watcher did not report file creation within 3 seconds");
+        while rx.try_recv().is_ok() {}
+
+        std::fs::remove_file(dir.join(&name)).unwrap();
+        let mut removed = false;
+        for _ in 0..10 {
+            if let Ok(names) = rx.recv_timeout(Duration::from_millis(100)) {
+                if names.iter().any(|seen| seen == &name) {
+                    removed = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            removed,
+            "watcher did not report the removed file within 1 second"
+        );
+
+        watcher.stop();
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

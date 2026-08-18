@@ -47,7 +47,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenu, BS_DEFPUSHBUTTON,
     BS_PUSHBUTTON, CS_DBLCLKS, ES_AUTOHSCROLL, HICON, HMENU, HTCLIENT, IDC_ARROW, IDC_SIZENESW,
     IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_SIZEALL, MF_CHECKED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MSG, SendMessageW, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW,
+    MF_STRING, MSG, SendMessageW, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_SHOW,
     SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, DI_NORMAL, SC_MINIMIZE, SIZE_MINIMIZED,
     TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage,
     ULW_ALPHA, UpdateLayeredWindow, WINDOW_STYLE, WNDCLASSW, WM_APP,
@@ -67,6 +68,11 @@ use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_P
 
 pub const WM_APP_REFRESH: u32 = WM_APP + 1;
 pub const WM_APP_DROP: u32 = WM_APP + 2;
+pub const WM_APP_MENU: u32 = WM_APP + 3;
+pub const WM_APP_RESIZED: u32 = WM_APP + 4;
+/// 目录监听按栅栏 id 通知(消息窗口处理,不持有具体 hwnd):
+/// 窗口被 Explorer 销毁重建后 watcher 无需重绑,仍能按 id 找到新窗口
+pub const WM_APP_REFRESH_ID: u32 = WM_APP + 6;
 /// “显示桌面”会尝试最小化所有独立顶层窗口；异步恢复可避免在 WM_SIZE 内递归。
 pub const WM_APP_DESKTOP_RESTORE: u32 = WM_APP + 20;
 
@@ -95,7 +101,7 @@ pub fn window_dpi(hwnd: HWND) -> f32 {
     unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32 / 96.0 }.max(1.0)
 }
 pub fn title_h(d: f32) -> i32 {
-    (30.0 * d) as i32
+    ((TITLE_FONT_PX.load(AtomicOrdering::Relaxed) as f32 + 18.0) * d).round() as i32
 }
 fn edge(d: f32) -> i32 {
     (8.0 * d) as i32
@@ -109,9 +115,15 @@ fn rail(d: f32) -> i32 {
 }
 /// 全局图标尺寸(逻辑像素):所有栅栏统一
 static ICON_PX: AtomicU32 = AtomicU32::new(32);
+/// 全局栅栏标题字号(逻辑像素):所有栅栏统一
+static TITLE_FONT_PX: AtomicU32 = AtomicU32::new(12);
 /// 设置全局图标尺寸(物理显示时再乘 DPI)
 pub fn set_icon_px(v: u32) {
     ICON_PX.store(v.max(16).min(128), AtomicOrdering::Relaxed);
+}
+/// 设置全局栅栏标题字号(物理显示时再乘 DPI)
+pub fn set_title_font_px(v: u32) {
+    TITLE_FONT_PX.store(v.clamp(10, 32), AtomicOrdering::Relaxed);
 }
 /// 图标尺寸(物理像素,按所在屏 DPI 缩放);取全局值,0 时回退 32
 fn icon(f: &Fence) -> i32 {
@@ -136,7 +148,7 @@ pub fn min_h(d: f32) -> i32 {
     (100.0 * d) as i32
 }
 fn font_title(d: f32) -> f32 {
-    11.5 * d
+    TITLE_FONT_PX.load(AtomicOrdering::Relaxed) as f32 * d
 }
 fn font_label(d: f32) -> f32 {
     // Windows 桌面图标的标签字号:9pt = 12px(逻辑像素,随 DPI 缩放)
@@ -267,9 +279,10 @@ pub struct Fence {
     pub top_row: f32,
     /// 翻页动画计时器是否在跑
     pub animating: bool,
-    /// 翻页动画已推进帧数 + 起始 top_row(固定时长 ease-out 用)
-    pub anim_frames: u32,
+    /// 翻页动画起始时间 + 起始 top_row(固定时长 ease-out 用)
+    pub anim_started: Instant,
     pub anim_from: f32,
+    perf_anim_remaining: u32,
     /// 滚轮增量累加器(1/120 刻度):触控板/高精度滚轮的小增量先累积,满 120 再翻页
     pub wheel_acc: i32,
     pub hover: Option<usize>,
@@ -278,6 +291,8 @@ pub struct Fence {
     pub moving: bool,
     pub move_off: (i32, i32),
     pub resizing: Option<ResizeDir>,
+    /// 按下后是否真的拖动/缩放移动过(区分单击标题与拖动:单击不触发 settle)
+    pub drag_moved: bool,
     pub hover_visible: bool,
     /// 拖出:按下的条目索引(移动超阈值后启动 OLE 拖拽)
     pub drag_idx: Option<usize>,
@@ -300,14 +315,16 @@ impl Fence {
             page: 0,
             top_row: 0.0,
             animating: false,
-            anim_frames: 0,
+            anim_started: Instant::now(),
             anim_from: 0.0,
+            perf_anim_remaining: 0,
             wheel_acc: 0,
             hover: None,
             selected: None,
             moving: false,
             move_off: (0, 0),
             resizing: None,
+            drag_moved: false,
             hover_visible: false,
             drag_idx: None,
             drag_down: (0, 0),
@@ -453,6 +470,22 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             }
         };
         if !hwnd.is_invalid() {
+            // 插到桌面层之上(Progman 之后):栅栏位于桌面背景之上、图标层/普通窗口之下。
+            // 不用 HWND_BOTTOM:实测会把窗口压到 Progman 之下的 DWM 隐藏区域,
+            // 窗口不可见且 FindWindow/EnumWindows 都枚举不到。
+            // 不挂 Progman 作父窗口(分层窗口+高 alpha+Progman 父窗口会触发 DWM
+            // 命中测试 bug,导致窗口可见但点不到拖不动)。
+            if let Some(host) = crate::utils::desktop_insert_host() {
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(host),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
             // 分层窗口:显示后整幅 ULW 提交(逐像素 alpha,透明面板透出桌面)。
             let _ = ShowWindow(hwnd, SW_SHOWNA);
             // 圆角由 DWM 裁
@@ -499,34 +532,63 @@ pub fn schedule_render(hwnd: HWND) {
 /// 刷新栅栏条目:folder 指定则显示该文件夹;否则显示收纳箱(vault)目录。
 /// 这样拖入文件(handle_drop 把无 folder 的栅栏文件移进 vault)会立即显示,重启后也持久。
 pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
+    let profiling = crate::perf::enabled();
+    let total_started = profiling.then(Instant::now);
     let page = f.page;
     let selected_path = f.selected.and_then(|i| f.entries.get(i)).map(|e| e.path.clone());
     f.entries.clear();
     let dir = f.cfg.folder.clone().unwrap_or_else(|| vault.clone());
+    let read_started = profiling.then(Instant::now);
+    let read_time;
+    let mut sort_time = Duration::default();
+    let mut succeeded = false;
     if let Ok(rd) = std::fs::read_dir(&dir) {
+        succeeded = true;
         for e in rd.flatten() {
             let path = e.path();
             let name = e.file_name().to_string_lossy().to_string();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
             f.entries.push(Entry { path, name, is_dir });
         }
+        read_time = read_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let sort_started = profiling.then(Instant::now);
         f.entries.sort_by(|a, b| {
             b.is_dir
                 .cmp(&a.is_dir)
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
+        sort_time = sort_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+    } else {
+        read_time = read_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
     }
     f.selected = selected_path.and_then(|p| f.entries.iter().position(|e| e.path == p));
     f.page = page;
     f.wheel_acc = 0;
     sync_page(f);
+    if let Some(started) = total_started {
+        crate::perf::record_refresh(
+            f.cfg.id,
+            &dir,
+            f.entries.len(),
+            read_time,
+            sort_time,
+            started.elapsed(),
+            succeeded,
+        );
+    }
 }
 
 #[cfg(test)]
 mod refresh_tests {
     use super::{
-        grid_dims, refresh_entries, Fence, RefreshState, RefreshTimerAction,
-        REFRESH_DEBOUNCE_MS,
+        animation_progress, grid_dims, refresh_entries, Fence, RefreshState, RefreshTimerAction,
+        ANIM_DURATION, REFRESH_DEBOUNCE_MS,
     };
     use crate::config::FenceCfg;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -553,6 +615,14 @@ mod refresh_tests {
             RefreshTimerAction::Idle
         );
         assert!(state.record_event(start + Duration::from_millis(202)));
+    }
+
+    #[test]
+    fn animation_progress_tracks_elapsed_time_and_clamps_at_the_end() {
+        assert_eq!(animation_progress(Duration::ZERO), 0.0);
+        assert_eq!(animation_progress(ANIM_DURATION / 2), 0.5);
+        assert_eq!(animation_progress(ANIM_DURATION), 1.0);
+        assert_eq!(animation_progress(ANIM_DURATION * 2), 1.0);
     }
 
     #[test]
@@ -684,6 +754,35 @@ pub fn fence_menu(hwnd: HWND) {
             );
         }
         let _ = AppendMenuW(menu, MF_POPUP, icon_menu.0 as usize, PCWSTR(w!("图标大小").as_ptr()));
+        // 标题字号子菜单(全局统一)
+        let cur_title_font = with_global(|g| g.config.title_font_size.max(1));
+        let title_font_menu = CreatePopupMenu().unwrap_or_default();
+        for (id, size) in [
+            (1013u32, 12u32),
+            (1014, 14),
+            (1015, 16),
+            (1016, 18),
+            (1017, 20),
+            (1018, 24),
+        ] {
+            let flags = if cur_title_font == size {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            let _ = AppendMenuW(
+                title_font_menu,
+                flags,
+                id as usize,
+                PCWSTR(wstr(&format!("{} px", size)).as_ptr()),
+            );
+        }
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            title_font_menu.0 as usize,
+            PCWSTR(w!("标题字号").as_ptr()),
+        );
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let cmd = TrackPopupMenu(
@@ -754,6 +853,24 @@ pub fn fence_menu(hwnd: HWND) {
                 set_icon_px(size);
                 g.config.icon = size;
                 // 图标尺寸变化 → 网格槽位/页数全变:所有栅栏重新吸附到新网格
+                let n = g.fences.len();
+                for i in 0..n {
+                    settle_fence(g, i);
+                }
+            });
+        } else if (1013..=1018).contains(&cmd) {
+            let size = match cmd {
+                1013 => 12,
+                1014 => 14,
+                1015 => 16,
+                1016 => 18,
+                1017 => 20,
+                _ => 24,
+            };
+            with_global(|g| {
+                set_title_font_px(size);
+                g.config.title_font_size = size;
+                // 标题栏高度随字号变化;重新吸附可保留完整图标行并避免文字被裁切。
                 let n = g.fences.len();
                 for i in 0..n {
                     settle_fence(g, i);
@@ -833,7 +950,7 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
             lpfnWndProc: Some(input_wndproc),
             hInstance: crate::hinstance(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: HBRUSH(16 as *mut std::ffi::c_void),
+            hbrBackground: HBRUSH(6 as *mut std::ffi::c_void), // COLOR_WINDOW+1 = 标准对话框底色
             lpszClassName: PCWSTR(w!("FeatherInput").as_ptr()),
             ..Default::default()
         };
@@ -1136,6 +1253,7 @@ unsafe extern "system" fn fence_wndproc(
                             // 否则会用旧的 cfg 位置,把窗口弹回原位
                             f.cfg.x = nx;
                             f.cfg.y = ny;
+                            f.drag_moved = true;
                             // 拖动中不重绘(内容没变;避免每帧全量重绘导致窗口忙/转圈)
                         } else if let Some(dir) = f.resizing {
                             let mut cur = POINT::default();
@@ -1179,6 +1297,7 @@ unsafe extern "system" fn fence_wndproc(
                             f.cfg.h = nh;
                             // 窗口尺寸实时变化 → 页/行重算,顶部行吸附到当前页首
                             sync_page(f);
+                            f.drag_moved = true;
                             need_render = true;
                         } else if f.drag_idx.is_some() {
                             // 拖出阈值:按下后鼠标移过系统拖拽阈值 → 启动 OLE 拖出。
@@ -1242,6 +1361,8 @@ unsafe extern "system" fn fence_wndproc(
                     let ghost = g.config.ghost_mode;
                     let avoid = g.config.desktop_avoid;
                     let f = &mut g.fences[idx];
+                    // 本按下周期内是否真实移动过(松手时决定要不要 settle)
+                    f.drag_moved = false;
                     if y < title_h(f.dpi) {
                         if avoid {
                             crate::desktop_icons::record_fence(&f.cfg);
@@ -1279,10 +1400,14 @@ unsafe extern "system" fn fence_wndproc(
         WM_LBUTTONUP => {
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
-                    let was_drag = g.fences[idx].moving || g.fences[idx].resizing.is_some();
+                    // 仅当真的拖动/缩放移动过才整理吸附;单击标题/边缘不触发
+                    // settle(否则点一下标题栅栏就跳到最近格点并改变尺寸)
+                    let was_drag = (g.fences[idx].moving || g.fences[idx].resizing.is_some())
+                        && g.fences[idx].drag_moved;
                     let had_item_press = g.fences[idx].drag_idx.is_some();
                     g.fences[idx].moving = false;
                     g.fences[idx].resizing = None;
+                    g.fences[idx].drag_moved = false;
                     // 普通单击(未达拖拽阈值)也会到这里:清除潜在拖出
                     g.fences[idx].drag_idx = None;
                     if was_drag || had_item_press {
@@ -1384,10 +1509,11 @@ unsafe extern "system" fn fence_wndproc(
                 with_global(|g| {
                     if let Some(idx) = fence_idx(g, hwnd) {
                         let f = &mut g.fences[idx];
-                        if f.animating {
-                            step_page_anim(f);
-                        }
+                        let finished = f.animating && !step_page_anim(f);
                         render_fence(&mut g.icons, g.config.ghost_mode, f);
+                        if finished {
+                            continue_perf_animation(f);
+                        }
                     }
                 });
             }
@@ -1584,17 +1710,25 @@ fn stop_page_anim(f: &mut Fence) {
     }
 }
 
-/// 翻页动画时长(帧,16ms/帧 → 约 200ms)
-const ANIM_FRAMES: u32 = 13;
+/// 翻页目标时长；按真实经过时间推进，慢帧会自然跳过中间位置。
+const ANIM_DURATION: Duration = Duration::from_millis(200);
+const ANIM_TICK_MS: u32 = 16;
+
+fn animation_progress(elapsed: Duration) -> f32 {
+    (elapsed.as_secs_f32() / ANIM_DURATION.as_secs_f32()).min(1.0)
+}
 
 /// 启动翻页动画(定时器驱动重绘):记录起始位置,固定时长 cubic ease-out
 fn start_page_anim(f: &mut Fence) {
     if !f.animating && !f.hwnd.is_invalid() {
         f.animating = true;
-        f.anim_frames = 0;
         f.anim_from = f.top_row;
+        f.anim_started = Instant::now()
+            .checked_sub(Duration::from_millis(ANIM_TICK_MS as u64))
+            .unwrap_or_else(Instant::now);
+        crate::perf::begin_animation(f.cfg.id);
         unsafe {
-            let _ = SetTimer(Some(f.hwnd), ANIM_TICK, 16, None);
+            let _ = SetTimer(Some(f.hwnd), ANIM_TICK, ANIM_TICK_MS, None);
         }
     }
 }
@@ -1604,8 +1738,7 @@ fn start_page_anim(f: &mut Fence) {
 fn step_page_anim(f: &mut Fence) -> bool {
     let (_, rows) = grid_dims(f);
     let target = f.page as f32 * rows as f32;
-    f.anim_frames += 1;
-    let t = (f.anim_frames as f32 / ANIM_FRAMES as f32).min(1.0);
+    let t = animation_progress(f.anim_started.elapsed());
     let e = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
     f.top_row = f.anim_from + (target - f.anim_from) * e;
     if t >= 1.0 {
@@ -1870,6 +2003,33 @@ unsafe fn draw_outlined_text(
     unsafe { draw_text(g, font, fmt, white, text, rect) };
 }
 
+/// 动画帧采用一次阴影 + 一次正文，静止帧保留八方向描边。
+/// 滚动中的文字本就在移动，减少重复绘制能明显降低帧耗时；落点画质不变。
+unsafe fn draw_label_line(
+    g: *mut GpGraphics,
+    font: *const GpFont,
+    fmt: *const GpStringFormat,
+    shadow: *const GpBrush,
+    white: *const GpBrush,
+    text: &str,
+    rect: RectF,
+    fast: bool,
+) {
+    if fast {
+        let shadow_rect = RectF {
+            X: rect.X + 1.0,
+            Y: rect.Y + 1.0,
+            Width: rect.Width,
+            Height: rect.Height,
+        };
+        draw_text(g, font, fmt, shadow, text, shadow_rect);
+        draw_text(g, font, fmt, white, text, rect);
+    } else {
+        draw_outlined_text(g, font, fmt, shadow, white, text, rect, 1.0);
+    }
+
+}
+
 /// 文件名称:仿 Windows 桌面图标标签 —— 白色文字 + 紧实深色描边,
 /// 单行放得下就单行,放不下自动两行,末行超长由 fmt 的省略号裁剪。
 unsafe fn draw_label(
@@ -1881,6 +2041,7 @@ unsafe fn draw_label(
     white: *const GpBrush,
     text: &str,
     rect: RectF,
+    fast: bool,
 ) {
     let w = wstr(text);
     let units: Vec<u16> = text.encode_utf16().collect();
@@ -1904,27 +2065,27 @@ unsafe fn draw_label(
     }
     // 描边固定 1 物理像素:整数偏移不会二次软化字形,八方向合起来仍是纤细一圈,
     // 不随 DPI 变粗(此前 round(dpi) 在 1.5× 下取到 2px,把标签撑得又粗又糊)。
-    let stroke = 1.0_f32;
     if (fitted as usize) >= total && bbox.Width <= rect.Width + 0.5 {
-        unsafe { draw_outlined_text(g, font, fmt, shadow, white, text, rect, stroke) };
+        unsafe { draw_label_line(g, font, fmt, shadow, white, text, rect, fast) };
         return;
     }
-    // 两行:第 1 行取能放下的字符数;若切点落在代理对中间(前一个码元是高代理)则前移
+    // 两行:第 1 行取能放下的字符数;代理对不能在中间切开
     let mut cut = (fitted as usize).clamp(1, total);
     if (0xD800..0xDC00).contains(&units[cut - 1]) {
-        cut -= 1;
+        cut -= 1; // 行尾不能是高代理(否则把高代理单独留在行尾)
     }
-    if cut == 0 {
-        cut = 1;
+    if cut < total && (0xDC00..0xE000).contains(&units[cut]) {
+        cut += 1; // 行首不能是低代理(否则把低代理单独甩到下一行)
     }
+    cut = cut.clamp(1, total);
     let line1 = String::from_utf16_lossy(&units[..cut]);
     let line2 = String::from_utf16_lossy(&units[cut..]);
     let half = rect.Height / 2.0;
     let r1 = RectF { X: rect.X, Y: rect.Y, Width: rect.Width, Height: half };
     let r2 = RectF { X: rect.X, Y: rect.Y + half, Width: rect.Width, Height: half };
     unsafe {
-        draw_outlined_text(g, font, fmt, shadow, white, &line1, r1, stroke);
-        draw_outlined_text(g, font, fmt, shadow, white, &line2, r2, stroke);
+        draw_label_line(g, font, fmt, shadow, white, &line1, r1, fast);
+        draw_label_line(g, font, fmt, shadow, white, &line2, r2, fast);
     }
 }
 
@@ -1990,32 +2151,80 @@ pub fn render_fence(icons: &mut crate::icons::IconCache, ghost_mode: bool, f: &m
         global = (255.0 * 0.16) as u8;
     }
     // 直接绘制+提交(不走 WM_PAINT;直接用 f,不查表——创建时 fence 还没进全局列表)
-    paint_core(icons, f, bg_alpha, global);
+    if let Some(sample) = paint_core(icons, f, bg_alpha, global) {
+        crate::perf::record_render(f.cfg.id, f.animating, sample);
+    }
+}
+
+pub fn start_perf_animation(f: &mut Fence) -> bool {
+    if !crate::perf::enabled() || total_pages(f) <= 1 {
+        return false;
+    }
+    f.perf_anim_remaining = crate::perf::animation_repeats().saturating_sub(1);
+    f.page = 1;
+    start_page_anim(f);
+    step_page_anim(f);
+    true
+}
+
+fn continue_perf_animation(f: &mut Fence) -> bool {
+    if f.perf_anim_remaining == 0 {
+        return false;
+    }
+    f.perf_anim_remaining -= 1;
+    f.page = usize::from(f.page == 0);
+    start_page_anim(f);
+    true
 }
 
 /// 核心绘制:画进每栅栏缓存 DIB(GDI+ 文字/图形 + GDI 图标),预乘 alpha 后
 /// UpdateLayeredWindow 整幅提交。半透明像素真透明透出桌面,内容画满矩形,圆角由 DWM 裁。
-fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, global: u8) {
+fn paint_core(
+    icons: &mut crate::icons::IconCache,
+    f: &mut Fence,
+    bg_alpha: u8,
+    global: u8,
+) -> Option<crate::perf::RenderSample> {
     let w = f.cfg.w;
     let h = f.cfg.h;
     if w <= 0 || h <= 0 {
-        return;
+        return None;
+    }
+    let profiling = crate::perf::enabled();
+    let total_started = profiling.then(Instant::now);
+    let mut sample = crate::perf::RenderSample {
+        width: w,
+        height: h,
+        entries: f.entries.len(),
+        ..Default::default()
+    };
+    if profiling {
+        let _ = icons.take_perf_stats();
     }
     unsafe {
         // 取/建缓存 DIB(尺寸不变则复用,避免每次重建);bits 为空 = 创建失败
+        let cache_started = profiling.then(Instant::now);
         let bits = ensure_cache(f, w, h);
+        sample.ensure_cache = cache_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
         if bits.is_null() {
-            return;
+            return None;
         }
         let memdc = match f.cache.as_ref() {
             Some(c) => c.mdc,
-            None => return,
+            None => return None,
         };
         // 整幅清成全透明(0),重画当前帧
+        let clear_started = profiling.then(Instant::now);
         std::ptr::write_bytes(bits, 0, (w as usize) * (h as usize) * 4);
+        sample.clear = clear_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let gdi_plus_started = profiling.then(Instant::now);
         let mut gfx: *mut GpGraphics = std::ptr::null_mut();
         if GdipCreateFromHDC(memdc, &mut gfx).0 != 0 {
-            return;
+            return None;
         }
         GdipSetSmoothingMode(gfx, SmoothingModeAntiAlias);
         // GridFit 把字形笔画对齐到物理像素网格,比普通灰阶抗锯齿更接近
@@ -2157,6 +2366,7 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                             Width: cell_w + 4.0,
                             Height: label_h(d) as f32 - 4.0,
                         };
+                        let label_started = profiling.then(Instant::now);
                         draw_label(
                             gfx,
                             label_font,
@@ -2166,7 +2376,12 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                             label_brush as *const GpBrush,
                             &e.name,
                             label_rect,
+                            f.animating,
                         );
+                        if let Some(started) = label_started {
+                            sample.label_count += 1;
+                            sample.label_time += started.elapsed();
+                        }
                     }
                 }
                 GdipResetClip(gfx);
@@ -2205,12 +2420,23 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
         GdipDeleteFontFamily(fam);
         GdipFlush(gfx, FlushIntentionSync);
         GdipDeleteGraphics(gfx);
+        sample.gdi_plus = gdi_plus_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        if profiling {
+            let icon_stats = icons.take_perf_stats();
+            sample.icon_hits = icon_stats.hits;
+            sample.icon_misses = icon_stats.misses;
+            sample.icon_hit_time = icon_stats.hit_time;
+            sample.icon_miss_time = icon_stats.miss_time;
+        }
 
         // 图标:GDI DrawIconEx 直绘进 DIB(背景/文字已由 GDI+ 画好)。
         // DrawIconEx 对 32bpp 图标做原生 alpha 合成,对掩码图标套 AND 掩码,
         // 透明区域保持面板颜色,不再出现不透明黑块。
         // GDI 不认 GDI+ 的裁剪区,这里单独给图标套一层 GDI 裁剪区(精确网格内容区),
         // 否则翻页动画中相邻页的图标会飘进 title/margin。
+        let gdi_icons_started = profiling.then(Instant::now);
         let icol = icon(f);
         let ctop = (title_h(d) + margin(d)) as i32;
         let cbot = ctop + grid_rows.max(0) * cell_h(f);
@@ -2227,10 +2453,14 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
                 let _ = DrawIconEx(memdc, *ix, *iy, *hicon, icol, icol, 0, None, DI_NORMAL);
             }
         }
+        sample.gdi_icons = gdi_icons_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
 
         // GDI+ 输出的是直通(straight)alpha,而 AlphaBlend 的 AC_SRC_ALPHA 要求
         // 颜色已按 alpha 预乘。逐像素转预乘(同时乘上 global 做幽灵淡出),否则半透明像素
         // 会被按预乘假定错误合成 → 图标透明处/圆角边缘出现色块、发暗。
+        let premultiply_started = profiling.then(Instant::now);
         let px = bits as *mut u32;
         let n = (w as usize) * (h as usize);
         let g = global as u32;
@@ -2247,11 +2477,22 @@ fn paint_core(icons: &mut crate::icons::IconCache, f: &mut Fence, bg_alpha: u8, 
             let r = (((p >> 16) & 0xFF) * a2) / 255;
             *px.add(i) = (a2 << 24) | (r << 16) | (gr << 8) | b;
         }
+        sample.premultiply = premultiply_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
 
         // 提交:UpdateLayeredWindow 整幅替换窗口表面。透明像素透出桌面(真透明),
         // 不透明像素直接显示——没有磨砂,内容移动也不会留残影。缓存保留供重建。
+        let ulw_started = profiling.then(Instant::now);
         if let Some(c) = &f.cache {
             submit_ulw(f.hwnd, c);
         }
+        sample.update_layered_window = ulw_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        sample.total = total_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
     }
+    profiling.then_some(sample)
 }

@@ -3,10 +3,28 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FenceKind {
+    /// 仅表示旧配置中缺少 kind 字段，加载后会立即迁移为明确类型。
+    Legacy,
+    #[default]
+    Collection,
+    Portal,
+    Download,
+}
+
+fn legacy_fence_kind() -> FenceKind {
+    FenceKind::Legacy
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FenceCfg {
     pub id: u32,
     pub title: String,
+    /// 栅栏的业务类型；旧配置缺少该字段时由 load() 自动推断。
+    #[serde(default = "legacy_fence_kind")]
+    pub kind: FenceKind,
     /// None = 收纳栅栏(空投区,拖入的文件移动到 vault)
     pub folder: Option<PathBuf>,
     pub x: i32,
@@ -16,6 +34,10 @@ pub struct FenceCfg {
     /// 保存该物理窗口矩形时的窗口 DPI。0 表示旧配置未记录。
     #[serde(default)]
     pub dpi: u32,
+    /// 是否已记录过真实位置。None = 旧配置(信任保存的 x/y,即使为 0,0);
+    /// Some(true) = 本版本放置过(0,0 也是合法位置)。用于区分"未放置"与"恰好放左上角"。
+    #[serde(default)]
+    pub pos_set: Option<bool>,
     #[serde(default = "default_opacity")]
     pub opacity: f32,
     /// 图标尺寸(旧版存于栅栏上;现由 Config.icon 全局统一。保留字段仅用于一次性迁移)
@@ -31,6 +53,14 @@ fn default_icon() -> u32 {
     32
 }
 
+fn default_title_font_size() -> u32 {
+    12
+}
+
+pub fn normalize_title_font_size(value: u32) -> u32 {
+    value.clamp(10, 32)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -40,6 +70,7 @@ impl Default for FenceCfg {
         FenceCfg {
             id: 0,
             title: "栅栏".into(),
+            kind: FenceKind::Collection,
             folder: None,
             x: 0,
             y: 0,
@@ -48,6 +79,7 @@ impl Default for FenceCfg {
             dpi: 96,
             opacity: default_opacity(),
             icon: default_icon(),
+            pos_set: None,
         }
     }
 }
@@ -83,6 +115,9 @@ pub struct Config {
     /// 全局图标尺寸(逻辑像素,默认 32)
     #[serde(default = "default_icon")]
     pub icon: u32,
+    /// 全局栅栏标题字号(逻辑像素,默认 12)
+    #[serde(default = "default_title_font_size")]
+    pub title_font_size: u32,
     /// 配置格式版本:
     /// - 缺省/1:旧版物理 x/y/w/h,未记录 DPI
     /// - 2:逻辑 x/y/w/h,启动时统一乘系统 DPI
@@ -107,6 +142,7 @@ impl Default for Config {
             download_enabled: true,
             download_box_visible: true,
             icon: default_icon(),
+            title_font_size: default_title_font_size(),
             desktop_avoid: false,
             version: 3,
         }
@@ -193,14 +229,98 @@ mod dpi_tests {
     }
 
     #[test]
+    fn pos_set_legacy_config_is_none_and_roundtrips() {
+        // 旧配置没有 pos_set 字段 → None(信任保存的 x/y,含 (0,0))
+        let old = r#"{"fences":[{"id":1,"title":"t","folder":null,"x":0,"y":0,"w":260,"h":340}]}"#;
+        let c: Config = serde_json::from_str(old).unwrap();
+        assert_eq!(c.fences[0].pos_set, None);
+        // 新配置保存 Some(true),序列化后原样恢复
+        let c2 = Config {
+            fences: vec![FenceCfg {
+                id: 2,
+                title: "t".into(),
+                x: 0,
+                y: 0,
+                pos_set: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&c2).unwrap();
+        let back: Config = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.fences[0].pos_set, Some(true));
+        assert_eq!(back.fences[0].x, 0);
+    }
+
+    #[test]
     fn legacy_config_keeps_download_capture_enabled_and_visible() {
         let c: Config = serde_json::from_str("{}").unwrap();
         assert!(c.download_enabled);
         assert!(c.download_box_visible);
+        assert_eq!(c.title_font_size, 12);
+    }
+
+    #[test]
+    fn title_font_size_is_clamped_to_supported_bounds() {
+        assert_eq!(normalize_title_font_size(0), 10);
+        assert_eq!(normalize_title_font_size(18), 18);
+        assert_eq!(normalize_title_font_size(100), 32);
+    }
+
+    #[test]
+    fn missing_fence_kind_deserializes_as_legacy() {
+        let mut value = serde_json::to_value(FenceCfg::default()).unwrap();
+        value.as_object_mut().unwrap().remove("kind");
+
+        let fence: FenceCfg = serde_json::from_value(value).unwrap();
+
+        assert_eq!(fence.kind, FenceKind::Legacy);
+    }
+
+    #[test]
+    fn legacy_fence_kinds_are_migrated_from_existing_configuration() {
+        let boxes_root = PathBuf::from(r"C:\Users\test\AppData\Roaming\feather-fences\boxes");
+        let legacy = |id, folder| FenceCfg {
+            id,
+            kind: FenceKind::Legacy,
+            folder,
+            ..FenceCfg::default()
+        };
+        let mut c = Config {
+            download_box_id: Some(1),
+            fences: vec![
+                legacy(1, Some(boxes_root.join("下载收纳箱"))),
+                legacy(2, None),
+                legacy(3, Some(boxes_root.join("收纳箱"))),
+                legacy(4, Some(PathBuf::from(r"D:\Documents"))),
+                legacy(5, Some(boxes_root.join("nested").join("portal"))),
+                FenceCfg {
+                    id: 6,
+                    kind: FenceKind::Portal,
+                    folder: Some(boxes_root.join("explicit")),
+                    ..FenceCfg::default()
+                },
+            ],
+            ..Config::default()
+        };
+
+        migrate_fence_kinds_with_root(&mut c, &boxes_root);
+
+        assert_eq!(c.fences[0].kind, FenceKind::Download);
+        assert_eq!(c.fences[1].kind, FenceKind::Collection);
+        assert_eq!(c.fences[2].kind, FenceKind::Collection);
+        assert_eq!(c.fences[3].kind, FenceKind::Portal);
+        assert_eq!(c.fences[4].kind, FenceKind::Portal);
+        assert_eq!(c.fences[5].kind, FenceKind::Portal);
     }
 }
 
 pub fn config_dir() -> PathBuf {
+    if crate::perf::enabled() {
+        if let Some(path) = std::env::var_os("FEATHER_PERF_CONFIG_DIR") {
+            return PathBuf::from(path);
+        }
+    }
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -209,6 +329,33 @@ pub fn config_dir() -> PathBuf {
 
 pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
+}
+
+/// 把缺少 kind 字段的旧栅栏配置迁移为明确类型。
+pub fn migrate_fence_kinds(c: &mut Config) {
+    let boxes_root = config_dir().join("boxes");
+    migrate_fence_kinds_with_root(c, &boxes_root);
+}
+
+fn migrate_fence_kinds_with_root(c: &mut Config, boxes_root: &Path) {
+    for fence in &mut c.fences {
+        if fence.kind != FenceKind::Legacy {
+            continue;
+        }
+        fence.kind = if c.download_box_id == Some(fence.id) {
+            FenceKind::Download
+        } else if fence.folder.is_none()
+            || fence
+                .folder
+                .as_deref()
+                .and_then(Path::parent)
+                .is_some_and(|parent| parent == boxes_root)
+        {
+            FenceKind::Collection
+        } else {
+            FenceKind::Portal
+        };
+    }
 }
 
 pub fn default_vault_dir() -> PathBuf {
@@ -226,7 +373,8 @@ pub fn vault_dir(c: &Config) -> PathBuf {
 pub fn load() -> Config {
     let p = config_path();
     if let Ok(s) = fs::read_to_string(&p) {
-        if let Ok(c) = serde_json::from_str::<Config>(&s) {
+        if let Ok(mut c) = serde_json::from_str::<Config>(&s) {
+            migrate_fence_kinds(&mut c);
             return c;
         }
     }

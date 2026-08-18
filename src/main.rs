@@ -14,6 +14,7 @@ mod dragout;
 mod droptarget;
 mod fence;
 mod icons;
+mod perf;
 mod tray;
 mod utils;
 mod watcher;
@@ -37,7 +38,7 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_CONTROL};
 use windows::Win32::UI::Shell::{
     SHBrowseForFolderW, SHGetKnownFolderPath, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE,
-    BIF_RETURNONLYFSDIRS, BROWSEINFOW, FOLDERID_Desktop, ShellExecuteW,
+    BIF_RETURNONLYFSDIRS, BROWSEINFOW, FOLDERID_Desktop, FOLDERID_PublicDesktop, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -50,7 +51,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::Win32::System::Ole::RegisterDragDrop;
 
-use config::{Config, FenceCfg};
+use config::{Config, FenceCfg, FenceKind};
 use fence::{Fence, WM_APP_DROP};
 use tray::{
     WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DESKTOP_AVOID, MENU_DESKTOP_ROLLBACK,
@@ -71,11 +72,13 @@ pub struct Global {
     pub desktop_host: Option<HWND>,
     pub icons: icons::IconCache,
     pub sweep_retry: Vec<(PathBuf, PathBuf)>,
-    /// 桌面监听线程传来的文件名；主线程等待写入稳定后移入下载收纳箱。
-    pub desktop_rx: Receiver<Vec<String>>,
-    pub desktop_seen: HashSet<PathBuf>,
+    /// 桌面监听线程传来的文件名；主线程等待新增快捷方式写入稳定后自动收纳。
+    pub desktop_rx: Receiver<Vec<PathBuf>>,
+    pub shortcut_seen: HashSet<PathBuf>,
+    pub shortcut_pending: HashMap<PathBuf, FileCandidate>,
     pub download_rx: Receiver<Vec<String>>,
-    pub download_pending: HashMap<PathBuf, DownloadCandidate>,
+    pub download_seen: HashSet<PathBuf>,
+    pub download_pending: HashMap<PathBuf, FileCandidate>,
     pub exiting: bool,
     /// 拖放 COM 对象,保持存活
     pub droptargets: Vec<windows::Win32::System::Ole::IDropTarget>,
@@ -110,10 +113,17 @@ impl ManagedWatcher {
     }
 }
 
-pub struct DownloadCandidate {
+pub struct FileCandidate {
     len: u64,
     modified: Option<std::time::SystemTime>,
     stable_ticks: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CollectionStats {
+    id: u32,
+    shortcuts: u64,
+    files: u64,
 }
 
 static G: OnceLock<Mutex<Global>> = OnceLock::new();
@@ -171,9 +181,11 @@ pub fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
         cfg.id = g.next_id;
         g.next_id += 1;
     }
-    // 默认位置:屏幕右上角级联(按系统 DPI 缩放逻辑像素偏移;创建窗口前无 hwnd)
+    // 默认位置:屏幕右上角级联(按系统 DPI 缩放逻辑像素偏移;创建窗口前无 hwnd)。
+    // 判定"未放置"用 pos_set:旧配置缺字段且 x/y 恰为 (0,0) 时视为未放置;
+    // 本版本保存过的位置(含真正的 (0,0))一律原样恢复。
     let ms = fence::dpi_scale();
-    if cfg.x == 0 && cfg.y == 0 {
+    if cfg.pos_set != Some(true) && cfg.x == 0 && cfg.y == 0 {
         let (sw, sh) = utils::screen_size();
         let n = g.fences.len();
         cfg.x = (sw - (320.0 * ms) as i32 - (20.0 * ms) as i32 - (n as i32 % 5) * (30.0 * ms) as i32).max(0);
@@ -276,27 +288,32 @@ pub fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     f.cfg.w = (final_rect.right - final_rect.left).max(1);
     f.cfg.h = (final_rect.bottom - final_rect.top).max(1);
     f.cfg.dpi = (f.dpi * 96.0).round() as u32;
+    f.cfg.pos_set = Some(true); // 位置已确定(含恰好 (0,0) 的情况)
     fence::refresh_entries(&mut f, &config::vault_dir(&g.config));
     fence::render_fence(&mut g.icons, g.config.ghost_mode, &mut f);
     let id = f.cfg.id;
+    // 目录监听(所有栅栏):文件夹栅栏监听门户目录,收纳栅栏监听收纳箱目录。
+    // 通知按栅栏 id 发给消息窗口——不持有具体 hwnd,窗口被 Explorer 销毁重建后
+    // watcher 无需重绑仍能按 id 找到新窗口;删除栅栏/重载时随 ManagedWatcher 停止。
+    let watch_dir = f.cfg.folder.clone().unwrap_or_else(|| config::vault_dir(&g.config));
+    let fid = id;
+    let mhwnd = g.msg_hwnd.0 as usize;
     g.fences.push(f);
     // 新栅栏立即落到网格:尺寸/位置吸附 + clamp 工作区 + 消除重叠
     let new_idx = g.fences.len() - 1;
     fence::settle_fence(g, new_idx);
 
-    // 门户目录监听
-    if let Some((folder, refresh_signal)) = g.fences.last().and_then(|f| {
-        f.cfg
-            .folder
-            .clone()
-            .map(|folder| (folder, f.refresh_signal.clone()))
-    }) {
-        let hwnd2 = hwnd.0 as usize;
-        let watcher = watcher::spawn_dir_watcher(folder, move |_names| {
-            refresh_signal.post(HWND(hwnd2 as *mut c_void));
-        });
-        g.watchers.push(ManagedWatcher::fence(id, watcher));
-    }
+    let watcher = watcher::spawn_dir_watcher(watch_dir, move |_names| {
+        unsafe {
+            PostMessageW(
+                Some(HWND(mhwnd as *mut c_void)),
+                fence::WM_APP_REFRESH_ID,
+                WPARAM(fid as usize),
+                LPARAM(0),
+            );
+        }
+    });
+    g.watchers.push(ManagedWatcher::fence(fid, watcher));
     sync_config(g);
     id
 }
@@ -319,19 +336,24 @@ pub fn delete_fence(g: &mut Global, idx: usize) {
 
 fn ensure_download_box(g: &mut Global) {
     let dir = config::download_box_dir();
-    let exists = g
+    let existing_idx = g
         .config
         .download_box_id
-        .is_some_and(|id| g.fences.iter().any(|f| f.valid && f.cfg.id == id));
-    if exists {
+        .and_then(|id| g.fences.iter().position(|f| f.valid && f.cfg.id == id));
+    if let Some(idx) = existing_idx {
+        if g.fences[idx].cfg.kind != FenceKind::Download {
+            g.fences[idx].cfg.kind = FenceKind::Download;
+            sync_config(g);
+        }
         return;
     }
-    if let Some(id) = g
+    if let Some(idx) = g
         .fences
         .iter()
-        .find(|f| f.valid && f.cfg.folder.as_deref() == Some(dir.as_path()))
-        .map(|f| f.cfg.id)
+        .position(|f| f.valid && f.cfg.folder.as_deref() == Some(dir.as_path()))
     {
+        let id = g.fences[idx].cfg.id;
+        g.fences[idx].cfg.kind = FenceKind::Download;
         g.config.download_box_id = Some(id);
         sync_config(g);
         return;
@@ -342,6 +364,7 @@ fn ensure_download_box(g: &mut Global) {
     let cfg = FenceCfg {
         id: 0,
         title: "下载收纳箱".into(),
+        kind: FenceKind::Download,
         folder: Some(dir),
         x: sw - (320.0 * s) as i32,
         y: (100.0 * s) as i32,
@@ -350,6 +373,7 @@ fn ensure_download_box(g: &mut Global) {
         dpi: (96.0 * s).round() as u32,
         opacity: 0.7,
         icon: 32,
+        pos_set: None,
     };
     let id = create_fence(g, cfg);
     if id != 0 {
@@ -374,7 +398,7 @@ fn downloads_dir() -> Option<PathBuf> {
 fn reset_download_tracking(g: &mut Global) {
     while g.download_rx.try_recv().is_ok() {}
     g.download_pending.clear();
-    g.desktop_seen = downloads_dir()
+    g.download_seen = downloads_dir()
         .and_then(|d| std::fs::read_dir(d).ok())
         .into_iter()
         .flatten()
@@ -425,7 +449,7 @@ fn apply_visibility(g: &mut Global) {
 }
 
 pub fn reserve_desktop_icons(g: &Global) {
-    if !g.config.desktop_avoid {
+    if !g.config.desktop_avoid || perf::safe_desktop() {
         return;
     }
     let rects: Vec<RECT> = g
@@ -484,8 +508,8 @@ fn watchdog_tick(g: &mut Global) {
             // 窗口被 Explorer 销毁,重建
             let cfg = f.cfg.clone();
             // 不挂 Progman(分层窗口+高 alpha+Progman 父窗口会触发 DWM 命中测试 bug,
-    // 导致窗口可见但点不到拖不动);改为独立顶层窗口 + 压底 Z 序(同 Fluid Fences 思路)
-    let hwnd = fence::create_window(&cfg, None);
+            // 导致窗口可见但点不到拖不动);改为独立顶层窗口 + 压底 Z 序(同 Fluid Fences 思路)
+            let hwnd = fence::create_window(&cfg, None);
             if !hwnd.is_invalid() {
                 let dt = droptarget::FenceDropTarget::new(hwnd);
                 let it: windows::Win32::System::Ole::IDropTarget = dt.into();
@@ -498,8 +522,27 @@ fn watchdog_tick(g: &mut Global) {
                 if g.zen {
                     unsafe { let _ = ShowWindow(hwnd, SW_HIDE); };
                 }
+                // watcher 仍挂在 f 上且按栅栏 id 通知,新窗口自动恢复实时刷新
                 fence::refresh_entries(f, &config::vault_dir(&g.config));
                 fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
+            }
+        }
+        // 周期回位:任何原因把栅栏从桌面层顶起时,3s 内插回桌面层之上。
+        // 用 desktop_insert_host(Progman 之后)而非 HWND_BOTTOM ——
+        // HWND_BOTTOM 会把窗口压进 Progman 之下的 DWM 隐藏区域(不可见)。
+        if f.valid {
+            if let Some(host) = utils::desktop_insert_host() {
+                unsafe {
+                    let _ = SetWindowPos(
+                        f.hwnd,
+                        Some(host),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
             }
         }
     }
@@ -613,6 +656,17 @@ pub fn handle_drop(hwnd: HWND, paths: Vec<String>) -> bool {
         if moved > 0 {
             unsafe { let _ = PostMessageW(Some(hwnd), WM_APP_DROP, WPARAM(0), LPARAM(0)); };
         }
+        if !failures.is_empty() {
+            // 拖放失败静默是历史缺陷:至少给用户一个托盘气泡提示
+            tray::notify_tip(
+                g.msg_hwnd,
+                "轻栅栏",
+                &format!(
+                    "{} 个文件未能移入目标目录(可能被占用或跨卷移动文件夹)",
+                    failures.len()
+                ),
+            );
+        }
         Some((target, moved, failures))
     });
 
@@ -663,6 +717,165 @@ fn ext_of(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+fn is_shortcut(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
+}
+
+fn scan_collection(id: u32, dir: &Path) -> Option<CollectionStats> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut stats = CollectionStats {
+        id,
+        shortcuts: 0,
+        files: 0,
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if is_shortcut(&entry.path()) {
+            stats.shortcuts = stats.shortcuts.saturating_add(1);
+        } else {
+            stats.files = stats.files.saturating_add(1);
+        }
+    }
+    Some(stats)
+}
+
+fn choose_collection(stats: &[CollectionStats]) -> Option<u32> {
+    if stats.iter().all(|stats| stats.shortcuts == 0) {
+        return stats
+            .iter()
+            .filter(|stats| stats.files == 0)
+            .min_by_key(|stats| stats.id)
+            .or_else(|| stats.iter().min_by_key(|stats| stats.id))
+            .map(|stats| stats.id);
+    }
+
+    stats
+        .iter()
+        .max_by(|a, b| {
+            let a_total = a.shortcuts.saturating_add(a.files).max(1) as u128;
+            let b_total = b.shortcuts.saturating_add(b.files).max(1) as u128;
+            ((a.shortcuts as u128) * b_total)
+                .cmp(&((b.shortcuts as u128) * a_total))
+                .then_with(|| a.shortcuts.cmp(&b.shortcuts))
+                // max_by 应把较小 ID 视为更优。
+                .then_with(|| b.id.cmp(&a.id))
+        })
+        .map(|stats| stats.id)
+}
+
+fn choose_collection_target(g: &Global) -> Option<(u32, PathBuf)> {
+    let vault = config::vault_dir(&g.config);
+    let candidates: Vec<(CollectionStats, PathBuf)> = g
+        .fences
+        .iter()
+        .filter(|f| f.valid && f.cfg.kind == FenceKind::Collection)
+        .filter_map(|f| {
+            let dir = f.cfg.folder.clone().unwrap_or_else(|| vault.clone());
+            scan_collection(f.cfg.id, &dir).map(|stats| (stats, dir))
+        })
+        .collect();
+    let stats: Vec<CollectionStats> = candidates.iter().map(|(stats, _)| *stats).collect();
+    let id = choose_collection(&stats)?;
+    candidates
+        .into_iter()
+        .find(|(stats, _)| stats.id == id)
+        .map(|(_, dir)| (id, dir))
+}
+
+fn queue_shortcut_candidate(pending: &mut HashMap<PathBuf, FileCandidate>, path: PathBuf) {
+    if !is_shortcut(&path) {
+        return;
+    }
+    pending.entry(path).or_insert(FileCandidate {
+        len: u64::MAX,
+        modified: None,
+        stable_ticks: 0,
+    });
+}
+
+fn queue_new_shortcut_candidate(
+    seen: &mut HashSet<PathBuf>,
+    pending: &mut HashMap<PathBuf, FileCandidate>,
+    path: PathBuf,
+) {
+    if is_shortcut(&path) && seen.insert(path.clone()) {
+        queue_shortcut_candidate(pending, path);
+    }
+}
+
+fn ingest_shortcut_events(g: &mut Global) {
+    while let Ok(paths) = g.desktop_rx.try_recv() {
+        for path in paths {
+            queue_new_shortcut_candidate(&mut g.shortcut_seen, &mut g.shortcut_pending, path);
+        }
+    }
+}
+
+fn shortcut_tick(g: &mut Global) {
+    ingest_shortcut_events(g);
+    let paths: Vec<PathBuf> = g.shortcut_pending.keys().cloned().collect();
+    let mut completed = Vec::new();
+    let mut moved_to = HashSet::new();
+
+    for path in paths {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            completed.push(path);
+            continue;
+        };
+        if !meta.is_file() || !is_shortcut(&path) {
+            completed.push(path);
+            continue;
+        }
+        let modified = meta.modified().ok();
+        let ready = if let Some(state) = g.shortcut_pending.get_mut(&path) {
+            if state.len == meta.len() && state.modified == modified {
+                state.stable_ticks = state.stable_ticks.saturating_add(1);
+            } else {
+                state.len = meta.len();
+                state.modified = modified;
+                state.stable_ticks = 0;
+            }
+            state.stable_ticks >= 2
+        } else {
+            false
+        };
+        if !ready {
+            continue;
+        }
+
+        let Some((id, target)) = choose_collection_target(g) else {
+            completed.push(path);
+            continue;
+        };
+        match watcher::move_to_dir(&path, &target) {
+            Ok(_) => {
+                completed.push(path);
+                moved_to.insert(id);
+            }
+            Err(e) => eprintln!("[feather] shortcut {:?} -> {}: {e}", path, target.display()),
+        }
+    }
+
+    for path in completed {
+        g.shortcut_pending.remove(&path);
+    }
+    g.shortcut_seen.retain(|path| path.exists());
+    if moved_to.is_empty() {
+        return;
+    }
+    for id in moved_to {
+        if let Some(f) = g.fences.iter_mut().find(|f| f.valid && f.cfg.id == id) {
+            fence::refresh_entries(f, &config::vault_dir(&g.config));
+            fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
+        }
+    }
+    reserve_desktop_icons(g);
+}
+
 pub fn sweep_desktop(g: &mut Global) {
     if g.config.download_enabled {
         ingest_desktop_events(g);
@@ -710,8 +923,8 @@ fn ingest_desktop_events(g: &mut Global) {
             if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case("desktop.ini")) {
                 continue;
             }
-            if path.is_file() && !is_download_temp(&path) && g.desktop_seen.insert(path.clone()) {
-                g.download_pending.insert(path, DownloadCandidate {
+            if path.is_file() && !is_download_temp(&path) && g.download_seen.insert(path.clone()) {
+                g.download_pending.insert(path, FileCandidate {
                     len: u64::MAX,
                     modified: None,
                     stable_ticks: 0,
@@ -720,7 +933,7 @@ fn ingest_desktop_events(g: &mut Global) {
         }
     }
     // 删除或已移动的路径不应永远占着 seen，允许日后同名下载再次被接管。
-    g.desktop_seen.retain(|p| p.exists());
+    g.download_seen.retain(|p| p.exists());
 }
 
 fn download_target(g: &Global) -> PathBuf {
@@ -767,7 +980,7 @@ fn download_tick(g: &mut Global) {
     }
     for path in completed {
         g.download_pending.remove(&path);
-        g.desktop_seen.remove(&path);
+        g.download_seen.remove(&path);
     }
     if let Some(id) = g.config.download_box_id {
         if let Some(f) = g.fences.iter_mut().find(|f| f.valid && f.cfg.id == id) {
@@ -792,8 +1005,21 @@ fn sweep_retry_tick(g: &mut Global) {
 }
 
 fn desktop_dir() -> Option<PathBuf> {
+    known_folder_dir(&FOLDERID_Desktop)
+}
+
+fn public_desktop_dir() -> Option<PathBuf> {
+    known_folder_dir(&FOLDERID_PublicDesktop)
+}
+
+fn known_folder_dir(folder_id: &windows::core::GUID) -> Option<PathBuf> {
     unsafe {
-        let p = SHGetKnownFolderPath(&FOLDERID_Desktop, windows::Win32::UI::Shell::KNOWN_FOLDER_FLAG(0), None).ok()?;
+        let p = SHGetKnownFolderPath(
+            folder_id,
+            windows::Win32::UI::Shell::KNOWN_FOLDER_FLAG(0),
+            None,
+        )
+        .ok()?;
         let s = String::from_utf16_lossy(p.as_wide());
         CoTaskMemFree(Some(p.as_ptr() as *const c_void));
         Some(PathBuf::from(s))
@@ -910,7 +1136,10 @@ unsafe extern "system" fn msg_wndproc(
         match wparam.0 {
             TID_WATCHDOG => with_global(|g| watchdog_tick(g)),
             TID_SWEEP_RETRY => with_global(|g| sweep_retry_tick(g)),
-            TID_DOWNLOADS => with_global(|g| download_tick(g)),
+            TID_DOWNLOADS => with_global(|g| {
+                download_tick(g);
+                shortcut_tick(g);
+            }),
             TID_DESKTOP_LAYER => with_global(|g| desktop_layer_tick(g)),
             _ => {}
         }
@@ -918,6 +1147,19 @@ unsafe extern "system" fn msg_wndproc(
     }
     if msg == WM_APP_SWEEP {
         with_global(|g| sweep_desktop(g));
+        return LRESULT(0);
+    }
+    // 目录监听按栅栏 id 通知:窗口重建后依然有效(不依赖具体 hwnd)
+    if msg == fence::WM_APP_REFRESH_ID {
+        let id = wparam.0 as u32;
+        with_global(|g| {
+            if let Some(idx) = g.fences.iter().position(|f| f.valid && f.cfg.id == id) {
+                let ghost = g.config.ghost_mode;
+                let f = &mut g.fences[idx];
+                fence::refresh_entries(f, &config::vault_dir(&g.config));
+                fence::render_fence(&mut g.icons, ghost, f);
+            }
+        });
         return LRESULT(0);
     }
     if msg == WM_DESTROY {
@@ -938,9 +1180,11 @@ fn dispatch_menu(cmd: u32) {
                         .unwrap_or_else(|| "文件夹栅栏".into());
                     let (sw, _sh) = utils::screen_size();
                     let s = fence::dpi_scale();
+                    // id 传 0,由 create_fence 统一分配并递增 next_id(避免重复 id)
                     let cfg = FenceCfg {
-                        id: g.next_id,
+                        id: 0,
                         title,
+                        kind: FenceKind::Portal,
                         folder: Some(folder),
                         x: sw - (340.0 * s) as i32,
                         y: (100.0 * s) as i32 + (g.fences.len() as i32 % 5) * (40.0 * s) as i32,
@@ -949,6 +1193,7 @@ fn dispatch_menu(cmd: u32) {
                         dpi: (96.0 * s).round() as u32,
                         opacity: 0.7,
                         icon: 32,
+                        pos_set: None,
                     };
                     create_fence(g, cfg);
                 }
@@ -985,6 +1230,7 @@ fn dispatch_menu(cmd: u32) {
                     let cfg = FenceCfg {
                         id: 0,
                         title,
+                        kind: FenceKind::Collection,
                         folder: Some(dir),
                         x: sw - (320.0 * s) as i32,
                         y: (100.0 * s) as i32 + (g.fences.len() as i32 % 5) * (40.0 * s) as i32,
@@ -993,6 +1239,7 @@ fn dispatch_menu(cmd: u32) {
                         dpi: (96.0 * s).round() as u32,
                         opacity: 0.7,
                         icon: 32,
+                        pos_set: None,
                     };
                     create_fence(g, cfg);
                 }
@@ -1067,6 +1314,9 @@ fn dispatch_menu(cmd: u32) {
             with_global(|g| {
                 let mut c = config::load();
                 config::normalize_dpi(&mut c);
+                c.title_font_size = config::normalize_title_font_size(c.title_font_size);
+                fence::set_icon_px(c.icon);
+                fence::set_title_font_px(c.title_font_size);
                 g.config = c;
                 // 保留进程级监听（桌面清扫和 Downloads 接管）；先停止所有栅栏监听，
                 // 避免窗口销毁期间仍收到刷新。
@@ -1080,10 +1330,17 @@ fn dispatch_menu(cmd: u32) {
                         let _ = DestroyWindow(h);
                     }
                 }
-                g.fences.clear();
+                g.fences.clear(); // Fence 析构 → 各自目录监听自动停止
                 g.droptargets.clear();
+                // 与启动恢复一致:重复/缺失 id 重新分配,保证按 id 刷新全部生效
+                let mut seen = std::collections::HashSet::new();
                 for cfg in g.config.fences.clone() {
-                    create_fence(g, cfg);
+                    let mut c = cfg;
+                    if c.id == 0 || !seen.insert(c.id) {
+                        c.id = g.next_id;
+                        g.next_id += 1;
+                    }
+                    create_fence(g, c);
                 }
                 ensure_download_box(g);
                 apply_visibility(g);
@@ -1115,6 +1372,7 @@ fn dispatch_menu(cmd: u32) {
 
 fn main() {
     dlog("[main] start");
+    perf::init();
     utils::set_dpi_awareness();
     dlog("[main] dpi set");
 
@@ -1211,13 +1469,26 @@ fn main() {
             .map(|f| f.icon)
             .unwrap_or(32);
     }
+    cfg.title_font_size = config::normalize_title_font_size(cfg.title_font_size);
     fence::set_icon_px(cfg.icon);
+    fence::set_title_font_px(cfg.title_font_size);
     let vault = config::vault_dir(&cfg);
     let _ = std::fs::create_dir_all(&vault);
 
-    let (desktop_tx, desktop_rx) = mpsc::channel::<Vec<String>>();
+    let (desktop_tx, desktop_rx) = mpsc::channel::<Vec<PathBuf>>();
     let (download_tx, download_rx) = mpsc::channel::<Vec<String>>();
-    let desktop_seen = downloads_dir()
+    let mut shortcut_seen = HashSet::new();
+    for dir in [desktop_dir(), public_desktop_dir()].into_iter().flatten() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            shortcut_seen.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| is_shortcut(path)),
+            );
+        }
+    }
+    let download_seen = downloads_dir()
         .and_then(|dir| std::fs::read_dir(dir).ok())
         .map(|rd| rd.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();
@@ -1232,8 +1503,10 @@ fn main() {
         icons: icons::IconCache::new(),
         sweep_retry: Vec::new(),
         desktop_rx,
-        desktop_seen,
+        shortcut_seen,
+        shortcut_pending: HashMap::new(),
         download_rx,
+        download_seen,
         download_pending: HashMap::new(),
         exiting: false,
         droptargets: Vec::new(),
@@ -1286,10 +1559,41 @@ fn main() {
     let fences = cfg.fences.clone();
     dlog(&format!("[main] restoring {} fences", fences.len()));
     with_global(|g| {
+        // 旧版 bug 曾产生重复 id(如多个文件夹栅栏 id 全为 1);按 id 通知的
+        // watcher 只命中第一个,其余栅栏失去自动刷新 —— 恢复时重新分配唯一 id
+        let mut seen = std::collections::HashSet::new();
         for fcfg in &fences {
-            create_fence(g, fcfg.clone());
+            let mut c = fcfg.clone();
+            if c.id == 0 || !seen.insert(c.id) {
+                c.id = g.next_id;
+                g.next_id += 1;
+            }
+            create_fence(g, c);
         }
-        // 始终保留专用下载收纳箱；是否接管/显示由两个独立配置控制。
+        // 首启:没有栅栏就建一个默认收纳箱(右侧),并保存配置
+        if g.fences.is_empty() {
+            let (sw, _sh) = utils::screen_size();
+            let s = fence::dpi_scale();
+            let box_cfg = FenceCfg {
+                id: 0, // 由 create_fence 分配;直接传 next_id 不会递增,会与后续新建栅栏撞 id
+                title: "收纳箱".into(),
+                kind: config::FenceKind::Collection,
+                folder: None,
+                x: sw - (320.0 * s) as i32,
+                y: (100.0 * s) as i32,
+                w: (260.0 * s) as i32,
+                h: (340.0 * s) as i32,
+                dpi: (96.0 * s).round() as u32,
+                opacity: 0.74,
+                icon: 32,
+                pos_set: None,
+            };
+            // 创建成功才保存,避免失败时把配置覆盖成空
+            if create_fence(g, box_cfg) != 0 {
+                sync_config(g);
+            }
+        }
+        // 始终保留专用下载收纳箱;是否接管/显示由两个独立配置控制。
         ensure_download_box(g);
         // 网格落位:恢复后把所有栅栏吸附到整数槽位、clamp 进工作区,
         // 并推挤消除重叠 —— 重启后布局也保持规整
@@ -1303,8 +1607,10 @@ fn main() {
             let rules = g.config.sweep_rules.clone();
             let mhwnd = g.msg_hwnd.0 as usize;
             let tx = desktop_tx.clone();
+            let watched_dir = dir.clone();
             let watcher = watcher::spawn_dir_watcher(dir.clone(), move |names| {
-                let _ = tx.send(names.clone());
+                let paths = names.iter().map(|name| watched_dir.join(name)).collect();
+                let _ = tx.send(paths);
                 for n in &names {
                     let ext = Path::new(&n)
                         .extension()
@@ -1325,6 +1631,18 @@ fn main() {
             });
             g.watchers.push(ManagedWatcher::process(watcher));
         }
+        // 安装器也可能把快捷方式写入所有用户共享的公共桌面。
+        if let Some(dir) =
+            public_desktop_dir().filter(|public| desktop_dir().as_deref() != Some(public.as_path()))
+        {
+            let tx = desktop_tx.clone();
+            let watched_dir = dir.clone();
+            let watcher = watcher::spawn_dir_watcher(dir, move |names| {
+                let paths = names.iter().map(|name| watched_dir.join(name)).collect();
+                let _ = tx.send(paths);
+            });
+            g.watchers.push(ManagedWatcher::process(watcher));
+        }
         // 下载收纳箱：单独监听 Downloads 目录，避免把桌面所有文件都当下载。
         if let Some(dir) = downloads_dir() {
             let tx = download_tx.clone();
@@ -1334,6 +1652,13 @@ fn main() {
             g.watchers.push(ManagedWatcher::process(watcher));
         }
         reserve_desktop_icons(g);
+        if let Some(id) = perf::animation_fence_id() {
+            if let Some(f) = g.fences.iter_mut().find(|f| f.valid && f.cfg.id == id) {
+                if fence::start_perf_animation(f) {
+                    fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
+                }
+            }
+        }
     });
 
     dlog(&format!("[main] started, fences: {}", fences.len()));
@@ -1387,4 +1712,93 @@ fn main() {
         let _ = CloseHandle(mutex);
     }
     eprintln!("[feather] bye");
+}
+
+#[cfg(test)]
+mod shortcut_collection_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn stats(id: u32, shortcuts: u64, files: u64) -> CollectionStats {
+        CollectionStats {
+            id,
+            shortcuts,
+            files,
+        }
+    }
+
+    #[test]
+    fn empty_box_wins_when_no_box_has_shortcuts() {
+        let boxes = [stats(9, 0, 5), stats(4, 0, 0), stats(2, 0, 3)];
+
+        assert_eq!(choose_collection(&boxes), Some(4));
+    }
+
+    #[test]
+    fn lowest_id_wins_when_no_box_has_shortcuts_or_is_empty() {
+        let boxes = [stats(9, 0, 5), stats(2, 0, 3)];
+
+        assert_eq!(choose_collection(&boxes), Some(2));
+    }
+
+    #[test]
+    fn highest_shortcut_ratio_wins() {
+        let boxes = [stats(1, 3, 1), stats(2, 4, 2), stats(3, 0, 0)];
+
+        assert_eq!(choose_collection(&boxes), Some(1));
+    }
+
+    #[test]
+    fn more_shortcuts_win_when_ratios_are_equal() {
+        let boxes = [stats(1, 1, 1), stats(2, 3, 3)];
+
+        assert_eq!(choose_collection(&boxes), Some(2));
+    }
+
+    #[test]
+    fn lowest_id_breaks_a_complete_tie() {
+        let boxes = [stats(8, 3, 3), stats(2, 3, 3)];
+
+        assert_eq!(choose_collection(&boxes), Some(2));
+        assert_eq!(choose_collection(&[]), None);
+    }
+
+    #[test]
+    fn collection_scan_counts_files_only_and_matches_lnk_case_insensitively() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "feather-fences-shortcuts-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        std::fs::write(dir.join("app.LNK"), b"shortcut").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"file").unwrap();
+        std::fs::write(dir.join("folder").join("nested.lnk"), b"nested").unwrap();
+
+        let actual = scan_collection(7, &dir);
+
+        assert_eq!(actual, Some(stats(7, 1, 1)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_notifications_share_one_pending_candidate() {
+        let mut seen = HashSet::new();
+        let mut pending = HashMap::new();
+        let path = PathBuf::from(r"C:\Users\test\Desktop\App.lnk");
+
+        queue_new_shortcut_candidate(&mut seen, &mut pending, path.clone());
+        queue_new_shortcut_candidate(&mut seen, &mut pending, path);
+        queue_new_shortcut_candidate(
+            &mut seen,
+            &mut pending,
+            PathBuf::from(r"C:\Users\test\Desktop\notes.txt"),
+        );
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(seen.len(), 1);
+    }
 }
