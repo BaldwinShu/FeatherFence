@@ -47,7 +47,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenu, BS_DEFPUSHBUTTON,
     BS_PUSHBUTTON, CS_DBLCLKS, ES_AUTOHSCROLL, HICON, HMENU, HTCLIENT, IDC_ARROW, IDC_SIZENESW,
     IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_SIZEALL, MF_CHECKED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MSG, SendMessageW, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW,
+    MF_STRING, MSG, SendMessageW, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_SHOW,
     SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, DI_NORMAL, SC_MINIMIZE, SIZE_MINIMIZED,
     TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage,
     ULW_ALPHA, UpdateLayeredWindow, WINDOW_STYLE, WNDCLASSW, WM_APP,
@@ -67,6 +68,11 @@ use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_P
 
 pub const WM_APP_REFRESH: u32 = WM_APP + 1;
 pub const WM_APP_DROP: u32 = WM_APP + 2;
+pub const WM_APP_MENU: u32 = WM_APP + 3;
+pub const WM_APP_RESIZED: u32 = WM_APP + 4;
+/// 目录监听按栅栏 id 通知(消息窗口处理,不持有具体 hwnd):
+/// 窗口被 Explorer 销毁重建后 watcher 无需重绑,仍能按 id 找到新窗口
+pub const WM_APP_REFRESH_ID: u32 = WM_APP + 6;
 /// “显示桌面”会尝试最小化所有独立顶层窗口；异步恢复可避免在 WM_SIZE 内递归。
 pub const WM_APP_DESKTOP_RESTORE: u32 = WM_APP + 20;
 
@@ -284,6 +290,8 @@ pub struct Fence {
     pub moving: bool,
     pub move_off: (i32, i32),
     pub resizing: Option<ResizeDir>,
+    /// 按下后是否真的拖动/缩放移动过(区分单击标题与拖动:单击不触发 settle)
+    pub drag_moved: bool,
     pub hover_visible: bool,
     /// 拖出:按下的条目索引(移动超阈值后启动 OLE 拖拽)
     pub drag_idx: Option<usize>,
@@ -314,6 +322,7 @@ impl Fence {
             moving: false,
             move_off: (0, 0),
             resizing: None,
+            drag_moved: false,
             hover_visible: false,
             drag_idx: None,
             drag_down: (0, 0),
@@ -459,6 +468,22 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             }
         };
         if !hwnd.is_invalid() {
+            // 插到桌面层之上(Progman 之后):栅栏位于桌面背景之上、图标层/普通窗口之下。
+            // 不用 HWND_BOTTOM:实测会把窗口压到 Progman 之下的 DWM 隐藏区域,
+            // 窗口不可见且 FindWindow/EnumWindows 都枚举不到。
+            // 不挂 Progman 作父窗口(分层窗口+高 alpha+Progman 父窗口会触发 DWM
+            // 命中测试 bug,导致窗口可见但点不到拖不动)。
+            if let Some(host) = crate::utils::desktop_insert_host() {
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(host),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
             // 分层窗口:显示后整幅 ULW 提交(逐像素 alpha,透明面板透出桌面)。
             let _ = ShowWindow(hwnd, SW_SHOWNA);
             // 圆角由 DWM 裁
@@ -886,7 +911,7 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
             lpfnWndProc: Some(input_wndproc),
             hInstance: crate::hinstance(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: HBRUSH(16 as *mut std::ffi::c_void),
+            hbrBackground: HBRUSH(6 as *mut std::ffi::c_void), // COLOR_WINDOW+1 = 标准对话框底色
             lpszClassName: PCWSTR(w!("FeatherInput").as_ptr()),
             ..Default::default()
         };
@@ -1189,6 +1214,7 @@ unsafe extern "system" fn fence_wndproc(
                             // 否则会用旧的 cfg 位置,把窗口弹回原位
                             f.cfg.x = nx;
                             f.cfg.y = ny;
+                            f.drag_moved = true;
                             // 拖动中不重绘(内容没变;避免每帧全量重绘导致窗口忙/转圈)
                         } else if let Some(dir) = f.resizing {
                             let mut cur = POINT::default();
@@ -1232,6 +1258,7 @@ unsafe extern "system" fn fence_wndproc(
                             f.cfg.h = nh;
                             // 窗口尺寸实时变化 → 页/行重算,顶部行吸附到当前页首
                             sync_page(f);
+                            f.drag_moved = true;
                             need_render = true;
                         } else if f.drag_idx.is_some() {
                             // 拖出阈值:按下后鼠标移过系统拖拽阈值 → 启动 OLE 拖出。
@@ -1295,6 +1322,8 @@ unsafe extern "system" fn fence_wndproc(
                     let ghost = g.config.ghost_mode;
                     let avoid = g.config.desktop_avoid;
                     let f = &mut g.fences[idx];
+                    // 本按下周期内是否真实移动过(松手时决定要不要 settle)
+                    f.drag_moved = false;
                     if y < title_h(f.dpi) {
                         if avoid {
                             crate::desktop_icons::record_fence(&f.cfg);
@@ -1332,10 +1361,14 @@ unsafe extern "system" fn fence_wndproc(
         WM_LBUTTONUP => {
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
-                    let was_drag = g.fences[idx].moving || g.fences[idx].resizing.is_some();
+                    // 仅当真的拖动/缩放移动过才整理吸附;单击标题/边缘不触发
+                    // settle(否则点一下标题栅栏就跳到最近格点并改变尺寸)
+                    let was_drag = (g.fences[idx].moving || g.fences[idx].resizing.is_some())
+                        && g.fences[idx].drag_moved;
                     let had_item_press = g.fences[idx].drag_idx.is_some();
                     g.fences[idx].moving = false;
                     g.fences[idx].resizing = None;
+                    g.fences[idx].drag_moved = false;
                     // 普通单击(未达拖拽阈值)也会到这里:清除潜在拖出
                     g.fences[idx].drag_idx = None;
                     if was_drag || had_item_press {
@@ -1962,14 +1995,15 @@ unsafe fn draw_label(
         unsafe { draw_outlined_text(g, font, fmt, shadow, white, text, rect, stroke) };
         return;
     }
-    // 两行:第 1 行取能放下的字符数;若切点落在代理对中间(前一个码元是高代理)则前移
+    // 两行:第 1 行取能放下的字符数;代理对不能在中间切开
     let mut cut = (fitted as usize).clamp(1, total);
     if (0xD800..0xDC00).contains(&units[cut - 1]) {
-        cut -= 1;
+        cut -= 1; // 行尾不能是高代理(否则把高代理单独留在行尾)
     }
-    if cut == 0 {
-        cut = 1;
+    if cut < total && (0xDC00..0xE000).contains(&units[cut]) {
+        cut += 1; // 行首不能是低代理(否则把低代理单独甩到下一行)
     }
+    cut = cut.clamp(1, total);
     let line1 = String::from_utf16_lossy(&units[..cut]);
     let line2 = String::from_utf16_lossy(&units[cut..]);
     let half = rect.Height / 2.0;

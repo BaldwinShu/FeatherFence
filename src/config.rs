@@ -16,6 +16,10 @@ pub struct FenceCfg {
     /// 保存该物理窗口矩形时的窗口 DPI。0 表示旧配置未记录。
     #[serde(default)]
     pub dpi: u32,
+    /// 是否已记录过真实位置。None = 旧配置(信任保存的 x/y,即使为 0,0);
+    /// Some(true) = 本版本放置过(0,0 也是合法位置)。用于区分"未放置"与"恰好放左上角"。
+    #[serde(default)]
+    pub pos_set: Option<bool>,
     #[serde(default = "default_opacity")]
     pub opacity: f32,
     /// 图标尺寸(旧版存于栅栏上;现由 Config.icon 全局统一。保留字段仅用于一次性迁移)
@@ -56,6 +60,7 @@ impl Default for FenceCfg {
             dpi: 96,
             opacity: default_opacity(),
             icon: default_icon(),
+            pos_set: None,
         }
     }
 }
@@ -202,6 +207,30 @@ mod dpi_tests {
     fn unknown_saved_dpi_preserves_v1_extent() {
         assert_eq!(scale_extent_for_dpi(260, 0, 192), 260);
         assert_eq!(scale_extent_for_dpi(520, 192, 144), 390);
+    }
+
+    #[test]
+    fn pos_set_legacy_config_is_none_and_roundtrips() {
+        // 旧配置没有 pos_set 字段 → None(信任保存的 x/y,含 (0,0))
+        let old = r#"{"fences":[{"id":1,"title":"t","folder":null,"x":0,"y":0,"w":260,"h":340}]}"#;
+        let c: Config = serde_json::from_str(old).unwrap();
+        assert_eq!(c.fences[0].pos_set, None);
+        // 新配置保存 Some(true),序列化后原样恢复
+        let c2 = Config {
+            fences: vec![FenceCfg {
+                id: 2,
+                title: "t".into(),
+                x: 0,
+                y: 0,
+                pos_set: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&c2).unwrap();
+        let back: Config = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.fences[0].pos_set, Some(true));
+        assert_eq!(back.fences[0].x, 0);
     }
 
     #[test]
