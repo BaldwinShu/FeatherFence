@@ -3,10 +3,28 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FenceKind {
+    /// 仅表示旧配置中缺少 kind 字段，加载后会立即迁移为明确类型。
+    Legacy,
+    #[default]
+    Collection,
+    Portal,
+    Download,
+}
+
+fn legacy_fence_kind() -> FenceKind {
+    FenceKind::Legacy
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FenceCfg {
     pub id: u32,
     pub title: String,
+    /// 栅栏的业务类型；旧配置缺少该字段时由 load() 自动推断。
+    #[serde(default = "legacy_fence_kind")]
+    pub kind: FenceKind,
     /// None = 收纳栅栏(空投区,拖入的文件移动到 vault)
     pub folder: Option<PathBuf>,
     pub x: i32,
@@ -52,6 +70,7 @@ impl Default for FenceCfg {
         FenceCfg {
             id: 0,
             title: "栅栏".into(),
+            kind: FenceKind::Collection,
             folder: None,
             x: 0,
             y: 0,
@@ -247,6 +266,53 @@ mod dpi_tests {
         assert_eq!(normalize_title_font_size(18), 18);
         assert_eq!(normalize_title_font_size(100), 32);
     }
+
+    #[test]
+    fn missing_fence_kind_deserializes_as_legacy() {
+        let mut value = serde_json::to_value(FenceCfg::default()).unwrap();
+        value.as_object_mut().unwrap().remove("kind");
+
+        let fence: FenceCfg = serde_json::from_value(value).unwrap();
+
+        assert_eq!(fence.kind, FenceKind::Legacy);
+    }
+
+    #[test]
+    fn legacy_fence_kinds_are_migrated_from_existing_configuration() {
+        let boxes_root = PathBuf::from(r"C:\Users\test\AppData\Roaming\feather-fences\boxes");
+        let legacy = |id, folder| FenceCfg {
+            id,
+            kind: FenceKind::Legacy,
+            folder,
+            ..FenceCfg::default()
+        };
+        let mut c = Config {
+            download_box_id: Some(1),
+            fences: vec![
+                legacy(1, Some(boxes_root.join("下载收纳箱"))),
+                legacy(2, None),
+                legacy(3, Some(boxes_root.join("收纳箱"))),
+                legacy(4, Some(PathBuf::from(r"D:\Documents"))),
+                legacy(5, Some(boxes_root.join("nested").join("portal"))),
+                FenceCfg {
+                    id: 6,
+                    kind: FenceKind::Portal,
+                    folder: Some(boxes_root.join("explicit")),
+                    ..FenceCfg::default()
+                },
+            ],
+            ..Config::default()
+        };
+
+        migrate_fence_kinds_with_root(&mut c, &boxes_root);
+
+        assert_eq!(c.fences[0].kind, FenceKind::Download);
+        assert_eq!(c.fences[1].kind, FenceKind::Collection);
+        assert_eq!(c.fences[2].kind, FenceKind::Collection);
+        assert_eq!(c.fences[3].kind, FenceKind::Portal);
+        assert_eq!(c.fences[4].kind, FenceKind::Portal);
+        assert_eq!(c.fences[5].kind, FenceKind::Portal);
+    }
 }
 
 pub fn config_dir() -> PathBuf {
@@ -265,6 +331,33 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
+/// 把缺少 kind 字段的旧栅栏配置迁移为明确类型。
+pub fn migrate_fence_kinds(c: &mut Config) {
+    let boxes_root = config_dir().join("boxes");
+    migrate_fence_kinds_with_root(c, &boxes_root);
+}
+
+fn migrate_fence_kinds_with_root(c: &mut Config, boxes_root: &Path) {
+    for fence in &mut c.fences {
+        if fence.kind != FenceKind::Legacy {
+            continue;
+        }
+        fence.kind = if c.download_box_id == Some(fence.id) {
+            FenceKind::Download
+        } else if fence.folder.is_none()
+            || fence
+                .folder
+                .as_deref()
+                .and_then(Path::parent)
+                .is_some_and(|parent| parent == boxes_root)
+        {
+            FenceKind::Collection
+        } else {
+            FenceKind::Portal
+        };
+    }
+}
+
 pub fn default_vault_dir() -> PathBuf {
     config_dir().join("vault")
 }
@@ -280,7 +373,8 @@ pub fn vault_dir(c: &Config) -> PathBuf {
 pub fn load() -> Config {
     let p = config_path();
     if let Ok(s) = fs::read_to_string(&p) {
-        if let Ok(c) = serde_json::from_str::<Config>(&s) {
+        if let Ok(mut c) = serde_json::from_str::<Config>(&s) {
+            migrate_fence_kinds(&mut c);
             return c;
         }
     }
