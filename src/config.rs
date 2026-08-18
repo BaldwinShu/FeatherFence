@@ -31,6 +31,14 @@ fn default_icon() -> u32 {
     32
 }
 
+fn default_title_font_size() -> u32 {
+    12
+}
+
+pub fn normalize_title_font_size(value: u32) -> u32 {
+    value.clamp(10, 32)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -83,6 +91,9 @@ pub struct Config {
     /// 全局图标尺寸(逻辑像素,默认 32)
     #[serde(default = "default_icon")]
     pub icon: u32,
+    /// 全局栅栏标题字号(逻辑像素,默认 12)
+    #[serde(default = "default_title_font_size")]
+    pub title_font_size: u32,
     /// 配置格式版本:
     /// - 缺省/1:旧版物理 x/y/w/h,未记录 DPI
     /// - 2:逻辑 x/y/w/h,启动时统一乘系统 DPI
@@ -107,6 +118,7 @@ impl Default for Config {
             download_enabled: true,
             download_box_visible: true,
             icon: default_icon(),
+            title_font_size: default_title_font_size(),
             desktop_avoid: false,
             version: 3,
         }
@@ -197,6 +209,14 @@ mod dpi_tests {
         let c: Config = serde_json::from_str("{}").unwrap();
         assert!(c.download_enabled);
         assert!(c.download_box_visible);
+        assert_eq!(c.title_font_size, 12);
+    }
+
+    #[test]
+    fn title_font_size_is_clamped_to_supported_bounds() {
+        assert_eq!(normalize_title_font_size(0), 10);
+        assert_eq!(normalize_title_font_size(18), 18);
+        assert_eq!(normalize_title_font_size(100), 32);
     }
 }
 
