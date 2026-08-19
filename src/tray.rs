@@ -135,7 +135,7 @@ pub fn notify_tip(hwnd: HWND, title: &str, msg: &str) {
             nid.szInfo[i] = *c;
         }
         nid.szInfo[255] = 0;
-        Shell_NotifyIconW(NIM_MODIFY, &nid);
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 }
 
