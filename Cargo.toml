@@ -1,6 +1,6 @@
 [package]
 name = "feather-fences"
-version = "0.1.0"
+version = "0.1.4"
 edition = "2024"
 description = "轻栅栏 - 超轻量桌面分区整理工具 (Fences 轻量版, 内存占用极低)"
 
