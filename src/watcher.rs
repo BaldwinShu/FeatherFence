@@ -400,6 +400,64 @@ fn copy_then_remove_file(
     Ok(())
 }
 
+fn copy_file_new(src: &Path, dest: &Path) -> Result<(), String> {
+    let mut source = std::fs::File::open(src).map_err(|e| e.to_string())?;
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .map_err(|e| e.to_string())?;
+    std::io::copy(&mut source, &mut target).map_err(|e| e.to_string())?;
+    target.sync_all().map_err(|e| e.to_string())?;
+    if let Ok(metadata) = source.metadata() {
+        std::fs::set_permissions(dest, metadata.permissions()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn copy_dir_tree(src: &Path, dest: &Path) -> Result<(), String> {
+    std::fs::create_dir(dest).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let source = entry.path();
+        let target = dest.join(entry.file_name());
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_dir() {
+            copy_dir_tree(&source, &target)?;
+        } else {
+            copy_file_new(&source, &target)?;
+        }
+    }
+    if let Ok(metadata) = std::fs::metadata(src) {
+        std::fs::set_permissions(dest, metadata.permissions()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 复制项目到目标目录，保留源项目，并像 Explorer 一样为重名目标生成新名称。
+pub fn copy_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
+    if !dest_dir.exists() {
+        std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    }
+    let name = src.file_name().ok_or("no file name")?.to_os_string();
+    let dest = unique_dest(dest_dir, &name);
+    let result = if src.is_dir() {
+        copy_dir_tree(src, &dest)
+    } else {
+        copy_file_new(src, &dest)
+    };
+    if let Err(error) = result {
+        // `dest` was chosen as a unique name and created only by this copy attempt.
+        if dest.is_dir() {
+            let _ = std::fs::remove_dir_all(&dest);
+        } else {
+            let _ = std::fs::remove_file(&dest);
+        }
+        return Err(error);
+    }
+    Ok(dest)
+}
+
 /// 移动项目到目标目录（同卷 rename，跨卷文件 copy+delete），自动避免重名。
 pub fn move_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
     if !dest_dir.exists() {
@@ -448,7 +506,7 @@ pub fn unique_dest(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
 
 #[cfg(test)]
 mod move_tests {
-    use super::copy_then_remove_file;
+    use super::{copy_then_remove_file, copy_to_dir};
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
@@ -522,6 +580,25 @@ mod move_tests {
         assert!(error.contains("复制失败"));
         assert!(src.exists());
         assert_eq!(std::fs::read(&dest).unwrap(), b"existing content");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copy_to_dir_keeps_source_and_copies_nested_folders() {
+        let dir = test_dir();
+        let source_root = dir.join("source-root");
+        let source = source_root.join("folder");
+        let destination = dir.join("destination");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested").join("file.txt"), b"content").unwrap();
+
+        let copied = copy_to_dir(&source, &destination).unwrap();
+
+        assert!(source.join("nested").join("file.txt").exists());
+        assert_eq!(
+            std::fs::read(copied.join("nested").join("file.txt")).unwrap(),
+            b"content"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
