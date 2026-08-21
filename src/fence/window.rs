@@ -13,6 +13,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TrackMouseEvent, VK_DELETE, TME_LEAVE,
     TRACKMOUSEEVENT, TRACKMOUSEEVENT_FLAGS,
 };
+use windows::Win32::System::SystemServices::MK_LBUTTON;
 use windows::Win32::UI::Shell::{
     ShellExecuteW, SHFileOperationW, SHFILEOPSTRUCTW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
     FOF_NOERRORUI, FO_DELETE,
@@ -23,7 +24,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, HTCLIENT, IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
     IDC_SIZEALL, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SC_MINIMIZE, SIZE_MINIMIZED, WNDCLASSW,
-    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
     WM_SYSCOMMAND, WM_TIMER, WM_DISPLAYCHANGE, WM_DPICHANGED, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
     WS_POPUP,
@@ -157,6 +159,54 @@ pub(crate) fn fence_idx(g: &Global, hwnd: HWND) -> Option<usize> {
     g.fences.iter().position(|f| f.valid && f.hwnd == hwnd)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CancelledPointerInteraction {
+    geometry_changed: bool,
+    visual_changed: bool,
+}
+
+/// Clear every state that depends on owning the mouse capture. Windows can revoke capture
+/// without delivering WM_LBUTTONUP (for example when another window starts a modal action).
+/// Leaving `moving` set in that case makes the fence jump to a later, unrelated mouse move.
+fn reset_pointer_interaction(f: &mut super::Fence) -> CancelledPointerInteraction {
+    let geometry_changed = (f.moving || f.resizing.is_some()) && f.drag_moved;
+    let visual_changed = f.drag_idx.is_some() || f.hover.is_some();
+    f.moving = false;
+    f.resizing = None;
+    f.drag_moved = false;
+    f.drag_idx = None;
+    f.hover = None;
+    CancelledPointerInteraction {
+        geometry_changed,
+        visual_changed,
+    }
+}
+
+fn cancel_pointer_interaction(g: &mut Global, idx: usize, reason: &str) {
+    if idx >= g.fences.len() {
+        return;
+    }
+    let outcome = reset_pointer_interaction(&mut g.fences[idx]);
+    if !outcome.geometry_changed && !outcome.visual_changed {
+        return;
+    }
+    crate::dlog(&format!(
+        "[fence] pointer interaction cancelled: id={} reason={} geometry_changed={}",
+        g.fences[idx].cfg.id, reason, outcome.geometry_changed
+    ));
+    if outcome.visual_changed {
+        let ghost = g.config.ghost_mode;
+        render_fence(&mut g.icons, ghost, &mut g.fences[idx]);
+    }
+    if outcome.geometry_changed {
+        // Keep the last continuously-followed rectangle. Cancellation must not trigger the
+        // release-time grid/overlap snap, which is exactly what would look like another jump.
+        g.config.fences = config_snapshot(&g.fences);
+        crate::config::save(&g.config);
+        crate::reserve_desktop_icons(g);
+    }
+}
+
 pub fn schedule_render(hwnd: HWND) {
     // 直接渲染(渲染是纯函数,开销毫秒级)
     with_global(|g| {
@@ -266,6 +316,19 @@ unsafe extern "system" fn fence_wndproc(
             });
             return LRESULT(0);
         }
+        WM_CANCELMODE | WM_CAPTURECHANGED => {
+            with_global(|g| {
+                if let Some(idx) = fence_idx(g, hwnd) {
+                    let reason = if msg == WM_CAPTURECHANGED {
+                        "capture changed"
+                    } else {
+                        "cancel mode"
+                    };
+                    cancel_pointer_interaction(g, idx, reason);
+                }
+            });
+            return LRESULT(0);
+        }
         WM_KEYDOWN if wparam.0 == VK_DELETE.0 as usize => {
             let path = with_global(|g| {
                 let idx = fence_idx(g, hwnd)?;
@@ -291,6 +354,25 @@ unsafe extern "system" fn fence_wndproc(
         WM_MOUSEMOVE => {
             let x = low16(lparam.0 as usize);
             let y = high16(lparam.0 as usize);
+            // A captured drag should always report MK_LBUTTON. Defensively stop stale state if
+            // Windows did not deliver the expected button-up/capture-change sequence.
+            let has_left_button = wparam.0 & MK_LBUTTON.0 as usize != 0;
+            let cancelled = with_global(|g| {
+                let Some(idx) = fence_idx(g, hwnd) else {
+                    return false;
+                };
+                let f = &g.fences[idx];
+                let active = f.moving || f.resizing.is_some() || f.drag_idx.is_some();
+                if active && !has_left_button {
+                    cancel_pointer_interaction(g, idx, "mouse move without left button");
+                    true
+                } else {
+                    false
+                }
+            });
+            if cancelled {
+                return LRESULT(0);
+            }
             // 达到拖拽阈值后要启动的拖出(路径 + 目标目录),在 with_global 之外执行
             let mut drag_path: Option<(String, PathBuf)> = None;
             with_global(|g| {
@@ -721,4 +803,41 @@ unsafe extern "system" fn fence_wndproc(
         _ => {}
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(test)]
+mod pointer_interaction_tests {
+    use super::{reset_pointer_interaction, ResizeDir};
+    use crate::config::FenceCfg;
+    use crate::fence::Fence;
+    use windows::Win32::Foundation::HWND;
+
+    #[test]
+    fn cancelled_capture_clears_geometry_drag_without_requesting_a_snap() {
+        let mut fence = Fence::new(FenceCfg::default(), HWND::default());
+        fence.moving = true;
+        fence.resizing = Some(ResizeDir::SE);
+        fence.drag_moved = true;
+
+        let outcome = reset_pointer_interaction(&mut fence);
+
+        assert!(outcome.geometry_changed);
+        assert!(!fence.moving);
+        assert!(fence.resizing.is_none());
+        assert!(!fence.drag_moved);
+    }
+
+    #[test]
+    fn cancelled_capture_clears_pending_item_drag() {
+        let mut fence = Fence::new(FenceCfg::default(), HWND::default());
+        fence.drag_idx = Some(3);
+        fence.hover = Some(3);
+
+        let outcome = reset_pointer_interaction(&mut fence);
+
+        assert!(!outcome.geometry_changed);
+        assert!(outcome.visual_changed);
+        assert!(fence.drag_idx.is_none());
+        assert!(fence.hover.is_none());
+    }
 }
