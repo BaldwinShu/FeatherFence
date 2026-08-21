@@ -1,6 +1,6 @@
 // 栅栏窗口:创建(分层窗口)+ fence_wndproc 消息循环(拖动/缩放/翻页/删除/重命名)。
 use std::mem::size_of;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -418,7 +418,11 @@ unsafe extern "system" fn fence_wndproc(
             });
             // 在锁外启动 OLE 拖出(阻塞到松手);拖出后文件可能被移动/删除 → 重扫目录刷新
             if let Some((path, vault)) = drag_path {
+                let shortcut_dragout = crate::shortcut::begin_shortcut_dragout(Path::new(&path));
                 crate::dragout::start_drag(vec![path]);
+                if shortcut_dragout {
+                    crate::shortcut::finish_shortcut_dragout();
+                }
                 with_global(|g| {
                     if let Some(idx) = fence_idx(g, hwnd) {
                         let f = &mut g.fences[idx];
