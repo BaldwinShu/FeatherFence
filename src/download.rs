@@ -167,7 +167,7 @@ pub(crate) fn download_tick(g: &mut Global) {
             state.stable_ticks = 0;
         }
         // 连续约两秒无尺寸/时间变化后再移动，避免截断仍在写入的浏览器下载。
-        if state.stable_ticks >= 2 && watcher::move_to_dir(path, &target).is_ok() {
+        if state.stable_ticks >= 2 && watcher::move_to_dir_replace(path, &target).is_ok() {
             completed.push(path.clone());
         }
     }

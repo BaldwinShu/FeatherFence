@@ -153,7 +153,7 @@ pub(crate) fn shortcut_tick(g: &mut Global) {
             completed.push(path);
             continue;
         };
-        match watcher::move_to_dir(&path, &target) {
+        match watcher::move_to_dir_replace(&path, &target) {
             Ok(_) => {
                 completed.push(path);
                 moved_to.insert(id);
