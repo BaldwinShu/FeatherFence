@@ -7,7 +7,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, PAINTSTRUCT};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TrackMouseEvent, VK_DELETE, TME_LEAVE,
@@ -534,9 +534,34 @@ unsafe extern "system" fn fence_wndproc(
             return LRESULT(0);
         }
         WM_RBUTTONUP => {
-            // 右键任意位置都打开栅栏菜单(删除/重命名/透明度/图标大小)。
-            // 之前只认标题栏,右键内容区没反应 = 用户"无法删除"。改到任意位置。
-            fence_menu(hwnd);
+            // 右键落在图标上:选中该图标并弹出与桌面一致的系统 Shell 右键菜单;
+            // 右键标题栏/空白处:仍打开栅栏菜单(删除/重命名/透明度/图标大小)。
+            let x = low16(lparam.0 as usize);
+            let y = high16(lparam.0 as usize);
+            let mut target: Option<std::path::PathBuf> = None;
+            with_global(|g| {
+                if let Some(idx) = fence_idx(g, hwnd) {
+                    let ghost = g.config.ghost_mode;
+                    let f = &mut g.fences[idx];
+                    if y >= title_h(f.dpi) {
+                        let (cols, _) = grid_dims(f);
+                        if let Some(idx2) = hit_item(f, x, y, cols) {
+                            f.selected = Some(idx2);
+                            render_fence(&mut g.icons, ghost, f);
+                            target = f.entries.get(idx2).map(|e| e.path.clone());
+                        }
+                    }
+                }
+            });
+            match target {
+                Some(path) => {
+                    // 客户区 → 屏幕坐标;系统菜单在常驻后台线程构建+弹出,主线程不冻结。
+                    let mut pt = POINT { x, y };
+                    let _ = ClientToScreen(hwnd, &mut pt);
+                    crate::shellmenu::show_for_path_async(path, pt.x, pt.y);
+                }
+                None => fence_menu(hwnd),
+            }
             return LRESULT(0);
         }
         WM_MOUSEWHEEL => {

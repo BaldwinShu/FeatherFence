@@ -15,6 +15,7 @@ mod droptarget;
 mod fence;
 mod icons;
 mod perf;
+mod shellmenu;
 mod tray;
 mod utils;
 mod watcher;
@@ -706,6 +707,9 @@ fn main() {
     let ticon = make_tray_icon();
     add_tray(msg_hwnd, ticon);
     dlog("[main] tray ok");
+
+    // 后台预热系统右键扩展,减轻首次右键图标时的冷加载卡顿。
+    shellmenu::prewarm();
 
     // 热键 Ctrl+Alt+Z = Zen
     unsafe {
