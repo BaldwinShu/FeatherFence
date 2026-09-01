@@ -418,8 +418,12 @@ unsafe extern "system" fn fence_wndproc(
             });
             // 在锁外启动 OLE 拖出(阻塞到松手);拖出后文件可能被移动/删除 → 重扫目录刷新
             if let Some((path, vault)) = drag_path {
-                crate::dragout::start_drag(vec![path]);
+                crate::dragout::start_drag(vec![path.clone()]);
                 with_global(|g| {
+                    // issue #24 ①:拖出结束后(文件此时已落到桌面)把桌面路径登记为"已知",
+                    // 避免自动收纳把用户刚拖到桌面的快捷方式又抓回栅栏。必须在拖出之后登记,
+                    // 否则会被 shortcut_tick 末尾的存在性回收提前删除。
+                    crate::shortcut::suppress_autocollect_after_dragout(g, std::path::Path::new(&path));
                     if let Some(idx) = fence_idx(g, hwnd) {
                         let f = &mut g.fences[idx];
                         let keep_page = f.page;

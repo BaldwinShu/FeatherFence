@@ -189,11 +189,11 @@ pub fn with_global<R>(f: impl FnOnce(&mut Global) -> R) -> R {
 
 
 
-fn desktop_dir() -> Option<PathBuf> {
+pub(crate) fn desktop_dir() -> Option<PathBuf> {
     known_folder_dir(&FOLDERID_Desktop)
 }
 
-fn public_desktop_dir() -> Option<PathBuf> {
+pub(crate) fn public_desktop_dir() -> Option<PathBuf> {
     known_folder_dir(&FOLDERID_PublicDesktop)
 }
 
