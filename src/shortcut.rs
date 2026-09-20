@@ -106,7 +106,18 @@ fn choose_collection_target(g: &Global) -> Option<(u32, PathBuf)> {
         .filter(|f| f.valid && f.cfg.kind == FenceKind::Collection)
         .filter_map(|f| {
             let dir = f.cfg.folder.clone().unwrap_or_else(|| vault.clone());
-            scan_collection(f.cfg.id, &dir).map(|stats| (stats, dir))
+            match scan_collection(f.cfg.id, &dir) {
+                Some(stats) => Some((stats, dir)),
+                None => {
+                    // 诊断:收纳箱目录无法读取(路径不存在/无权限),该箱被排除出候选。
+                    crate::dlog(&format!(
+                        "[shortcut] 收纳箱#{} 目录无法扫描,跳过: {}",
+                        f.cfg.id,
+                        dir.display()
+                    ));
+                    None
+                }
+            }
         })
         .collect();
     let stats: Vec<CollectionStats> = candidates.iter().map(|(stats, _)| *stats).collect();
@@ -179,15 +190,21 @@ pub(crate) fn shortcut_tick(g: &mut Global) {
         }
 
         let Some((id, target)) = choose_collection_target(g) else {
+            crate::dlog(&format!("[shortcut] 无可用收纳箱,放弃 {:?}", path));
             completed.push(path);
             continue;
         };
         match watcher::move_to_dir(&path, &target) {
-            Ok(_) => {
+            Ok(dest) => {
+                crate::dlog(&format!("[shortcut] 已收纳 {:?} → {}", path, dest.display()));
                 completed.push(path);
                 moved_to.insert(id);
             }
-            Err(e) => eprintln!("[feather] shortcut {:?} -> {}: {e}", path, target.display()),
+            Err(e) => crate::dlog(&format!(
+                "[shortcut] 移动失败 {:?} → {}: {e}",
+                path,
+                target.display()
+            )),
         }
     }
 

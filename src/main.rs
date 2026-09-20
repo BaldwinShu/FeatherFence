@@ -947,6 +947,7 @@ fn main() {
         apply_visibility(g);
         // 桌面自动归类监听:线程里只做扩展名粗筛,命中就通知主线程执行整理
         if let Some(dir) = desktop_dir() {
+            dlog(&format!("[shortcut] 监听用户桌面: {}", dir.display()));
             let rules = g.config.sweep_rules.clone();
             let mhwnd = g.msg_hwnd.0 as usize;
             let tx = desktop_tx.clone();
@@ -978,6 +979,7 @@ fn main() {
         if let Some(dir) =
             public_desktop_dir().filter(|public| desktop_dir().as_deref() != Some(public.as_path()))
         {
+            dlog(&format!("[shortcut] 监听公共桌面: {}", dir.display()));
             let tx = desktop_tx.clone();
             let watched_dir = dir.clone();
             let watcher = watcher::spawn_dir_watcher(dir, move |names| {
