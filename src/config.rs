@@ -57,6 +57,10 @@ fn default_title_font_size() -> u32 {
     12
 }
 
+fn default_zen_hotkey() -> Option<String> {
+    Some("Ctrl+Alt+Z".into())
+}
+
 pub fn normalize_title_font_size(value: u32) -> u32 {
     value.clamp(10, 32)
 }
@@ -118,6 +122,9 @@ pub struct Config {
     /// 全局栅栏标题字号(逻辑像素,默认 12)
     #[serde(default = "default_title_font_size")]
     pub title_font_size: u32,
+    /// Zen 模式全局快捷键。空值表示禁用；缺省配置保留原有 Ctrl+Alt+Z。
+    #[serde(default = "default_zen_hotkey")]
+    pub zen_hotkey: Option<String>,
     /// 配置格式版本:
     /// - 缺省/1:旧版物理 x/y/w/h,未记录 DPI
     /// - 2:逻辑 x/y/w/h,启动时统一乘系统 DPI
@@ -143,6 +150,7 @@ impl Default for Config {
             download_box_visible: true,
             icon: default_icon(),
             title_font_size: default_title_font_size(),
+            zen_hotkey: default_zen_hotkey(),
             desktop_avoid: false,
             version: 3,
         }
@@ -258,6 +266,18 @@ mod dpi_tests {
         assert!(c.download_enabled);
         assert!(c.download_box_visible);
         assert_eq!(c.title_font_size, 12);
+        assert_eq!(c.zen_hotkey.as_deref(), Some("Ctrl+Alt+Z"));
+    }
+
+    #[test]
+    fn zen_hotkey_can_be_disabled_and_roundtrips() {
+        let config = Config {
+            zen_hotkey: None,
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.zen_hotkey, None);
     }
 
     #[test]

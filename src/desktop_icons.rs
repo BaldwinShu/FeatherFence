@@ -27,8 +27,8 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ};
 use windows::Win32::UI::Controls::{
-    LVM_GETITEMCOUNT, LVM_GETITEMPOSITION, LVM_GETITEMSPACING, LVM_SETITEMPOSITION,
-    LVS_AUTOARRANGE,
+    LVM_GETITEMCOUNT, LVM_GETITEMPOSITION, LVM_GETITEMRECT, LVM_GETITEMSPACING,
+    LVM_SETITEMPOSITION, LVS_AUTOARRANGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetWindowLongPtrW, GetWindowThreadProcessId, SendMessageW, SetWindowLongPtrW,
@@ -106,7 +106,7 @@ pub fn reserve(reserved_screen: &[RECT]) {
         let remote = VirtualAllocEx(
             process,
             None,
-            size_of::<POINT>(),
+            size_of::<RECT>(),
             MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE,
         );
@@ -114,6 +114,40 @@ pub fn reserve(reserved_screen: &[RECT]) {
             let _ = CloseHandle(process);
             return;
         }
+
+        // LVM_GETITEMSPACING 给的是网格步距(图标原点间距 = 可见外框 + 图标间空隙/标签留白),
+        // 比图标实际可见范围大一圈。若用整格步距判断"是否被栅栏盖住",紧邻栅栏、只在空隙处
+        // 碰到栅栏的一整行/列也会被判为被盖而多推开(表现为避让范围偏大、需隔开一行)。
+        // 改用图标可见外框(LVIR_BOUNDS)的尺寸判定,去掉步距里的空隙,贴近实际遮挡。
+        // 刚分配的远端缓冲已零填充,RECT.left = 0 = LVIR_BOUNDS(作为 LVM_GETITEMRECT 的输入代码)。
+        let (item_w, item_h) = {
+            let got = SendMessageW(
+                list,
+                LVM_GETITEMRECT,
+                Some(WPARAM(0)),
+                Some(LPARAM(remote as isize)),
+            )
+            .0 != 0;
+            let mut rc = RECT::default();
+            if got
+                && ReadProcessMemory(
+                    process,
+                    remote,
+                    &mut rc as *mut RECT as *mut c_void,
+                    size_of::<RECT>(),
+                    None,
+                )
+                .is_ok()
+            {
+                (
+                    (rc.right - rc.left).clamp(1, cell_w),
+                    (rc.bottom - rc.top).clamp(1, cell_h),
+                )
+            } else {
+                // 查询失败则回退到步距,行为与旧版一致。
+                (cell_w, cell_h)
+            }
+        };
 
         let mut positions = Vec::with_capacity(count as usize);
         for i in 0..count {
@@ -144,11 +178,12 @@ pub fn reserve(reserved_screen: &[RECT]) {
             }
         }
 
+        // 用图标可见外框尺寸(而非网格步距)判定遮挡,避免把只在空隙处碰到栅栏的相邻格误判为被盖。
         let item_rect = |p: POINT| RECT {
             left: p.x,
             top: p.y,
-            right: p.x + cell_w,
-            bottom: p.y + cell_h,
+            right: p.x + item_w,
+            bottom: p.y + item_h,
         };
         let blocked = |p: POINT| reserved.iter().any(|r| overlaps(item_rect(p), *r));
         let collides = |p: POINT, skip: usize, all: &[POINT]| {
