@@ -37,6 +37,7 @@ pub const MENU_DOWNLOAD_ENABLED: u32 = 2011;
 pub const MENU_DOWNLOAD_VISIBLE: u32 = 2012;
 pub const MENU_DESKTOP_AVOID: u32 = 2013;
 pub const MENU_DESKTOP_ROLLBACK: u32 = 2014;
+pub const MENU_ZEN_HOTKEY: u32 = 2015;
 
 pub fn make_tray_icon() -> HICON {
     // 16x16 三横条"栅栏"图标,带 alpha
@@ -143,6 +144,7 @@ pub fn notify_tip(hwnd: HWND, title: &str, msg: &str) {
 pub fn show_tray_menu(
     hwnd: HWND,
     zen: bool,
+    zen_hotkey: Option<&str>,
     ghost: bool,
     autostart: bool,
     download_enabled: bool,
@@ -151,6 +153,10 @@ pub fn show_tray_menu(
 ) -> u32 {
     unsafe {
         let menu = CreatePopupMenu().unwrap_or_default();
+        let zen_label = zen_hotkey
+            .map(|hotkey| format!("Zen 模式\t{hotkey}"))
+            .unwrap_or_else(|| "Zen 模式".into());
+        let zen_label_w = wstr(&zen_label);
         let _ = AppendMenuW(menu, MF_STRING, MENU_NEW_PORTAL as usize, PCWSTR(w!("新建文件夹栅栏…").as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, MENU_NEW_BOX as usize, PCWSTR(w!("新建收纳栅栏").as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -159,7 +165,13 @@ pub fn show_tray_menu(
             menu,
             if zen { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
             MENU_ZEN as usize,
-            PCWSTR(w!("Zen 模式\tCtrl+Alt+Z").as_ptr()),
+            PCWSTR(zen_label_w.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_ZEN_HOTKEY as usize,
+            PCWSTR(w!("设置 Zen 快捷键…").as_ptr()),
         );
         let _ = AppendMenuW(
             menu,

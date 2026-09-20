@@ -284,7 +284,7 @@ unsafe extern "system" fn input_wndproc(
 }
 
 /// 弹出单行文本输入对话框,返回输入内容;取消返回 None
-fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
+pub(crate) fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
     static REG: std::sync::Once = std::sync::Once::new();
     REG.call_once(|| unsafe {
         let wc = WNDCLASSW {
