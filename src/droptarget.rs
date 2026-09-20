@@ -12,7 +12,7 @@ use windows::Win32::System::Ole::CF_HDROP;
 use windows::Win32::System::Ole::{
     DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl,
 };
-use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+use windows::Win32::System::SystemServices::{MK_CONTROL, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{DragQueryFileW, ILCombine, ILFree, SHGetPathFromIDListW, HDROP};
 
@@ -59,8 +59,10 @@ fn shellidlist_format() -> FORMATETC {
 /// 其次 COPY,都不允许则 NONE。返回值必须是 allowed 的子集,否则光标显示禁止且 Drop 不触发。
 /// 桌面拖快捷方式/含命名空间项时 allowed 常是 MOVE|LINK(0x6)——不含 COPY,若硬编码
 /// 返回 COPY 会被判非法,这正是多选拖不进去的根因。
-fn pick_effect(allowed: DROPEFFECT) -> DROPEFFECT {
-    if allowed.0 & DROPEFFECT_MOVE.0 != 0 {
+fn pick_effect(allowed: DROPEFFECT, keys: MODIFIERKEYS_FLAGS) -> DROPEFFECT {
+    if keys.contains(MK_CONTROL) && allowed.0 & DROPEFFECT_COPY.0 != 0 {
+        DROPEFFECT_COPY
+    } else if allowed.0 & DROPEFFECT_MOVE.0 != 0 {
         DROPEFFECT_MOVE
     } else if allowed.0 & DROPEFFECT_COPY.0 != 0 {
         DROPEFFECT_COPY
@@ -170,7 +172,7 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
     fn DragEnter(
         &self,
         dataobj: Ref<IDataObject>,
-        _keys: MODIFIERKEYS_FLAGS,
+        keys: MODIFIERKEYS_FLAGS,
         _pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> Result<()> {
@@ -178,7 +180,7 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
             let accepts = supports_paths(dataobj.as_ref());
             self.accepts.set(accepts);
             *pdweffect = if accepts {
-                pick_effect(*pdweffect)
+                pick_effect(*pdweffect, keys)
             } else {
                 DROPEFFECT_NONE
             };
@@ -188,13 +190,13 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
 
     fn DragOver(
         &self,
-        _keys: MODIFIERKEYS_FLAGS,
+        keys: MODIFIERKEYS_FLAGS,
         _pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> Result<()> {
         unsafe {
             *pdweffect = if self.accepts.get() {
-                pick_effect(*pdweffect)
+                pick_effect(*pdweffect, keys)
             } else {
                 DROPEFFECT_NONE
             };
@@ -210,7 +212,7 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
     fn Drop(
         &self,
         dataobj: Ref<IDataObject>,
-        _keys: MODIFIERKEYS_FLAGS,
+        keys: MODIFIERKEYS_FLAGS,
         _pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
     ) -> Result<()> {
@@ -221,12 +223,39 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
                 *pdweffect = DROPEFFECT_NONE;
                 return Ok(());
             }
-            *pdweffect = if crate::handle_drop(self.hwnd, paths) {
-                DROPEFFECT_MOVE
+            let selected = pick_effect(*pdweffect, keys);
+            let copy_requested = selected == DROPEFFECT_COPY;
+            *pdweffect = if crate::handle_drop(self.hwnd, paths, copy_requested) {
+                selected
             } else {
                 DROPEFFECT_NONE
             };
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod effect_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_prefers_copy_and_plain_drag_prefers_move() {
+        let both = DROPEFFECT_COPY | DROPEFFECT_MOVE;
+
+        assert_eq!(pick_effect(both, MK_CONTROL), DROPEFFECT_COPY);
+        assert_eq!(
+            pick_effect(both, MODIFIERKEYS_FLAGS::default()),
+            DROPEFFECT_MOVE
+        );
+    }
+
+    #[test]
+    fn requested_effect_never_exceeds_source_permissions() {
+        assert_eq!(pick_effect(DROPEFFECT_MOVE, MK_CONTROL), DROPEFFECT_MOVE);
+        assert_eq!(
+            pick_effect(DROPEFFECT_COPY, MODIFIERKEYS_FLAGS::default()),
+            DROPEFFECT_COPY
+        );
     }
 }
