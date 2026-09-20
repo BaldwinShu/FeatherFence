@@ -25,6 +25,35 @@ pub(crate) fn is_shortcut(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
 }
 
+/// 某个拖出项落到各桌面目录后的路径(仅 .lnk);非 .lnk 返回空。
+fn dragout_ignore_targets(src: &Path, desktops: &[PathBuf]) -> Vec<PathBuf> {
+    if !is_shortcut(src) {
+        return Vec::new();
+    }
+    match src.file_name() {
+        Some(name) => desktops.iter().map(|dir| dir.join(name)).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// 用户把快捷方式从栅栏拖出后调用:把它落到桌面后的目标路径登记进 `shortcut_seen`,
+/// 让自动收纳把它视为"已知的桌面快捷方式"而不再立即抓回(issue #24 ①)。
+///
+/// 必须在 OLE 拖出**结束之后**调用:此时文件已真正落到桌面,`shortcut_tick` 末尾的
+/// `retain(|p| p.exists())` 不会把登记误删(拖出前登记会因文件尚不存在而被提前回收)。
+/// 同时清掉拖拽模态循环里可能已抢先入队的 pending,避免它在 2 个 tick 后被搬回。
+/// 若这次拖出没落到桌面(取消/拖回箱/拖到别处),该路径不存在,下一 tick 会自动清掉登记。
+pub(crate) fn suppress_autocollect_after_dragout(g: &mut Global, src: &Path) {
+    let desktops: Vec<PathBuf> = [crate::desktop_dir(), crate::public_desktop_dir()]
+        .into_iter()
+        .flatten()
+        .collect();
+    for target in dragout_ignore_targets(src, &desktops) {
+        g.shortcut_pending.remove(&target);
+        g.shortcut_seen.insert(target);
+    }
+}
+
 fn scan_collection(id: u32, dir: &Path) -> Option<CollectionStats> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut stats = CollectionStats {
@@ -245,6 +274,32 @@ mod shortcut_collection_tests {
 
         assert_eq!(actual, Some(stats(7, 1, 1)));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dragout_ignore_targets_cover_each_desktop_for_shortcuts() {
+        let desktops = [
+            PathBuf::from(r"C:\Users\test\Desktop"),
+            PathBuf::from(r"C:\Users\Public\Desktop"),
+        ];
+
+        let targets = dragout_ignore_targets(Path::new(r"D:\vault\App.lnk"), &desktops);
+
+        assert_eq!(
+            targets,
+            vec![
+                PathBuf::from(r"C:\Users\test\Desktop\App.lnk"),
+                PathBuf::from(r"C:\Users\Public\Desktop\App.lnk"),
+            ]
+        );
+    }
+
+    #[test]
+    fn dragout_ignore_targets_skip_non_shortcuts() {
+        let desktops = [PathBuf::from(r"C:\Users\test\Desktop")];
+
+        assert!(dragout_ignore_targets(Path::new(r"D:\vault\notes.txt"), &desktops).is_empty());
+        assert!(dragout_ignore_targets(Path::new(r"D:\vault\folder"), &desktops).is_empty());
     }
 
     #[test]
