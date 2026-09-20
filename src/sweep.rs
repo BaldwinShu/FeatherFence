@@ -28,7 +28,7 @@ pub(crate) fn sweep_desktop(g: &mut Global) {
         }
         let ext = ext_of(&p);
         if let Some(rule) = rules.iter().find(|r| r.ext.to_lowercase() == ext) {
-            match watcher::move_to_dir(&p, &rule.dest) {
+            match watcher::move_to_dir_replace(&p, &rule.dest) {
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("[feather] sweep {:?}: {e}", p);
@@ -42,7 +42,7 @@ pub(crate) fn sweep_retry_tick(g: &mut Global) {
     let mut keep = Vec::new();
     for (src, dest) in std::mem::take(&mut g.sweep_retry) {
         if src.exists() {
-            match watcher::move_to_dir(&src, &dest) {
+            match watcher::move_to_dir_replace(&src, &dest) {
                 Ok(_) => {}
                 Err(_) => keep.push((src, dest)),
             }

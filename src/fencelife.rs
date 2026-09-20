@@ -344,15 +344,22 @@ pub(crate) fn desktop_layer_tick(g: &mut Global) {
 }
 // ---------- 拖放处理 ----------
 
-fn format_drop_failures(target: &Path, moved: usize, failures: &[(String, String)]) -> String {
+fn format_drop_failures(
+    target: &Path,
+    succeeded: usize,
+    failures: &[(String, String)],
+    copy_requested: bool,
+) -> String {
     const MAX_DETAILS: usize = 5;
+    let operation = if copy_requested { "复制" } else { "移动" };
     let mut message = format!(
-        "有 {} 个项目未能移动到：\n{}\n\n",
+        "有 {} 个项目未能{}到：\n{}\n\n",
         failures.len(),
+        operation,
         target.display()
     );
-    if moved > 0 {
-        message.push_str(&format!("已成功移动 {moved} 个项目。\n\n"));
+    if succeeded > 0 {
+        message.push_str(&format!("已成功{operation} {succeeded} 个项目。\n\n"));
     }
     for (path, error) in failures.iter().take(MAX_DETAILS) {
         let name = Path::new(path)
@@ -368,8 +375,8 @@ fn format_drop_failures(target: &Path, moved: usize, failures: &[(String, String
     message
 }
 
-/// 处理拖入并返回是否至少移动了一个项目，供 OLE 向数据源报告真实结果。
-pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>) -> bool {
+/// 处理拖入并返回是否至少复制/移动了一个项目，供 OLE 向数据源报告真实结果。
+pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>, copy_requested: bool) -> bool {
     let result = with_global(|g| {
         let Some(idx) = g.fences.iter().position(|f| f.valid && f.hwnd == hwnd) else {
             return None;
@@ -387,7 +394,7 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>) -> bool {
             }
             vault
         };
-        let mut moved = 0usize;
+        let mut succeeded = 0usize;
         let mut failures = Vec::new();
         for p in &paths {
             let src = PathBuf::from(p);
@@ -395,19 +402,27 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>) -> bool {
                 failures.push((p.clone(), "源项目不存在或已被移动".to_string()));
                 continue;
             }
-            // 已在目标目录里则跳过
-            if src.parent().map(|d| d == target.as_path()).unwrap_or(false) {
+            // MOVE 到自身目录没有意义；COPY 到自身目录则应生成一个重名副本。
+            if !copy_requested
+                && src.parent().map(|d| d == target.as_path()).unwrap_or(false)
+            {
                 continue;
             }
-            match watcher::move_to_dir(&src, &target) {
-                Ok(_) => moved += 1,
+            let operation = if copy_requested {
+                watcher::copy_to_dir(&src, &target)
+            } else {
+                watcher::move_to_dir(&src, &target)
+            };
+            match operation {
+                Ok(_) => succeeded += 1,
                 Err(e) => {
-                    eprintln!("[feather] move {p} -> {} failed: {e}", target.display());
+                    let name = if copy_requested { "copy" } else { "move" };
+                    eprintln!("[feather] {name} {p} -> {} failed: {e}", target.display());
                     failures.push((p.clone(), e));
                 }
             }
         }
-        if moved > 0 {
+        if succeeded > 0 {
             unsafe { let _ = PostMessageW(Some(hwnd), WM_APP_DROP, WPARAM(0), LPARAM(0)); };
         }
         if !failures.is_empty() {
@@ -421,14 +436,14 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>) -> bool {
                 ),
             );
         }
-        Some((target, moved, failures))
+        Some((target, succeeded, failures))
     });
 
-    let Some((target, moved, failures)) = result else {
+    let Some((target, succeeded, failures)) = result else {
         return false;
     };
     if !failures.is_empty() {
-        let message = format_drop_failures(&target, moved, &failures);
+        let message = format_drop_failures(&target, succeeded, &failures, copy_requested);
         let message_w = wstr(&message);
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
@@ -439,7 +454,7 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>) -> bool {
             );
         }
     }
-    moved > 0
+    succeeded > 0
 }
 #[cfg(test)]
 mod drop_feedback_tests {
@@ -452,7 +467,7 @@ mod drop_feedback_tests {
             .map(|i| (format!("C:\\source\\file-{i}.txt"), "拒绝访问".to_string()))
             .collect();
 
-        let message = format_drop_failures(Path::new("D:\\target"), 2, &failures);
+        let message = format_drop_failures(Path::new("D:\\target"), 2, &failures, false);
 
         assert!(message.contains("有 7 个项目未能移动"));
         assert!(message.contains("已成功移动 2 个项目"));

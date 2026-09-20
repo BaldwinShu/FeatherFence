@@ -9,11 +9,11 @@ use std::time::Duration;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
+    CreateFileW, MoveFileExW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
     FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME,
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    MOVEFILE_COPY_ALLOWED, MOVEFILE_REPLACE_EXISTING, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::CancelSynchronousIo;
 
@@ -400,6 +400,64 @@ fn copy_then_remove_file(
     Ok(())
 }
 
+fn copy_file_new(src: &Path, dest: &Path) -> Result<(), String> {
+    let mut source = std::fs::File::open(src).map_err(|e| e.to_string())?;
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .map_err(|e| e.to_string())?;
+    std::io::copy(&mut source, &mut target).map_err(|e| e.to_string())?;
+    target.sync_all().map_err(|e| e.to_string())?;
+    if let Ok(metadata) = source.metadata() {
+        std::fs::set_permissions(dest, metadata.permissions()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn copy_dir_tree(src: &Path, dest: &Path) -> Result<(), String> {
+    std::fs::create_dir(dest).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let source = entry.path();
+        let target = dest.join(entry.file_name());
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_dir() {
+            copy_dir_tree(&source, &target)?;
+        } else {
+            copy_file_new(&source, &target)?;
+        }
+    }
+    if let Ok(metadata) = std::fs::metadata(src) {
+        std::fs::set_permissions(dest, metadata.permissions()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 复制项目到目标目录，保留源项目，并像 Explorer 一样为重名目标生成新名称。
+pub fn copy_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
+    if !dest_dir.exists() {
+        std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    }
+    let name = src.file_name().ok_or("no file name")?.to_os_string();
+    let dest = unique_dest(dest_dir, &name);
+    let result = if src.is_dir() {
+        copy_dir_tree(src, &dest)
+    } else {
+        copy_file_new(src, &dest)
+    };
+    if let Err(error) = result {
+        // `dest` was chosen as a unique name and created only by this copy attempt.
+        if dest.is_dir() {
+            let _ = std::fs::remove_dir_all(&dest);
+        } else {
+            let _ = std::fs::remove_file(&dest);
+        }
+        return Err(error);
+    }
+    Ok(dest)
+}
+
 /// 移动项目到目标目录（同卷 rename，跨卷文件 copy+delete），自动避免重名。
 pub fn move_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
     if !dest_dir.exists() {
@@ -421,6 +479,26 @@ pub fn move_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
             Ok(dest)
         }
     }
+}
+
+/// 自动移动文件到目标目录；同名目标存在时由系统直接替换。
+pub fn move_to_dir_replace(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
+    if !dest_dir.exists() {
+        std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    }
+    let name = src.file_name().ok_or("no file name")?;
+    let dest = dest_dir.join(name);
+    let wsrc = wstr(&src.to_string_lossy());
+    let wdest = wstr(&dest.to_string_lossy());
+    unsafe {
+        MoveFileExW(
+            PCWSTR(wsrc.as_ptr()),
+            PCWSTR(wdest.as_ptr()),
+            MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING,
+        )
+        .map_err(|e| format!("replace move {} -> {}: {e}", src.display(), dest.display()))?;
+    }
+    Ok(dest)
 }
 
 /// 目标已存在则加 "(1)"/"(2)" 后缀
@@ -448,7 +526,7 @@ pub fn unique_dest(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
 
 #[cfg(test)]
 mod move_tests {
-    use super::copy_then_remove_file;
+    use super::{copy_then_remove_file, copy_to_dir, move_to_dir, move_to_dir_replace};
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
@@ -522,6 +600,83 @@ mod move_tests {
         assert!(error.contains("复制失败"));
         assert!(src.exists());
         assert_eq!(std::fs::read(&dest).unwrap(), b"existing content");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replace_move_overwrites_existing_file_without_numbered_copy() {
+        let root = test_dir();
+        let source_dir = root.join("source");
+        let target_dir = root.join("target");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let source = source_dir.join("Example.lnk");
+        let target = target_dir.join("Example.lnk");
+        std::fs::write(&source, b"new shortcut").unwrap();
+        std::fs::write(&target, b"old shortcut").unwrap();
+
+        let moved = move_to_dir_replace(&source, &target_dir).unwrap();
+
+        assert_eq!(moved, target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"new shortcut");
+        assert!(!source.exists());
+        assert!(!target_dir.join("Example (1).lnk").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replace_move_handles_destination_without_conflict() {
+        let root = test_dir();
+        let source_dir = root.join("source");
+        let target_dir = root.join("target");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("Example.lnk");
+        std::fs::write(&source, b"shortcut").unwrap();
+
+        let moved = move_to_dir_replace(&source, &target_dir).unwrap();
+
+        assert_eq!(moved, target_dir.join("Example.lnk"));
+        assert_eq!(std::fs::read(moved).unwrap(), b"shortcut");
+        assert!(!source.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keep_both_move_still_uses_a_numbered_name() {
+        let root = test_dir();
+        let source_dir = root.join("source");
+        let target_dir = root.join("target");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let source = source_dir.join("Example.lnk");
+        let existing = target_dir.join("Example.lnk");
+        std::fs::write(&source, b"new shortcut").unwrap();
+        std::fs::write(&existing, b"old shortcut").unwrap();
+
+        let moved = move_to_dir(&source, &target_dir).unwrap();
+
+        assert_eq!(moved, target_dir.join("Example (1).lnk"));
+        assert_eq!(std::fs::read(existing).unwrap(), b"old shortcut");
+        assert_eq!(std::fs::read(moved).unwrap(), b"new shortcut");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copy_to_dir_keeps_source_and_copies_nested_folders() {
+        let dir = test_dir();
+        let source_root = dir.join("source-root");
+        let source = source_root.join("folder");
+        let destination = dir.join("destination");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested").join("file.txt"), b"content").unwrap();
+
+        let copied = copy_to_dir(&source, &destination).unwrap();
+
+        assert!(source.join("nested").join("file.txt").exists());
+        assert_eq!(
+            std::fs::read(copied.join("nested").join("file.txt")).unwrap(),
+            b"content"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
