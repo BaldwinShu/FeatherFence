@@ -49,6 +49,23 @@ pub(crate) struct RenderCache {
 // Fence 已手动标注 Send(HWND 等裸句柄);RenderCache 随 Fence 走,同样仅主线程访问
 unsafe impl Send for RenderCache {}
 
+/// 析构即释放 GDI 资源。**这个 Drop 不能少**:任何销毁 `Fence` 的路径(切换渲染模式 /
+/// 重载配置 / 删除栅栏)都会整批析构缓存,没有它每块 DIB + 内存 DC 都漏 —— 内存按
+/// w×h×4 堆积,GDI 句柄也一起漏(每栅栏 2 个,进程 GDI 配额只有 1 万)。
+///
+/// 顺序:先 `DeleteDC` 再 `DeleteObject` —— 位图还选在 DC 里时 `DeleteObject` 会直接
+/// 失败(FALSE),先删 DC 才会把位图摘下来。
+impl Drop for RenderCache {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteDC(self.mdc);
+            if !DeleteObject(HGDIOBJ(self.hbmp.0)).as_bool() {
+                crate::dlog("[feather] 缓存位图释放失败(仍被 DC 选中?)");
+            }
+        }
+    }
+}
+
 /// 取/建栅栏的渲染缓存(尺寸匹配则复用,否则重建)。返回像素指针;失败返回 null。
 fn ensure_cache(f: &mut Fence, w: i32, h: i32) -> *mut u8 {
     let need_new = match &f.cache {
@@ -56,12 +73,10 @@ fn ensure_cache(f: &mut Fence, w: i32, h: i32) -> *mut u8 {
         None => true,
     };
     if need_new {
-        if let Some(c) = f.cache.take() {
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(c.hbmp.0));
-                let _ = DeleteDC(c.mdc);
-            }
-        }
+        // 旧缓存交给 RenderCache::drop 释放(释放顺序也在那里)。这里**不能**再手写一遍:
+        // 原先的顺序是反的(先 DeleteObject —— 位图还选在 DC 里,直接返回 FALSE ——
+        // 再 DeleteDC),所以缩放栅栏重建缓存这条路径一直在漏。
+        f.cache = None;
         let mdc = unsafe { CreateCompatibleDC(None) };
         let mut bmi = BITMAPINFO::default();
         bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
