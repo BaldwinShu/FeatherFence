@@ -17,6 +17,7 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 
+use crate::config::RenderMode;
 use crate::utils::wstr;
 
 pub const WM_APP_TRAY: u32 = 0x8000 + 10;
@@ -38,6 +39,7 @@ pub const MENU_DOWNLOAD_VISIBLE: u32 = 2012;
 pub const MENU_DESKTOP_AVOID: u32 = 2013;
 pub const MENU_DESKTOP_ROLLBACK: u32 = 2014;
 pub const MENU_ZEN_HOTKEY: u32 = 2015;
+pub const MENU_RENDER_MODE: u32 = 2016;
 
 pub fn make_tray_icon() -> HICON {
     // 16x16 三横条"栅栏"图标,带 alpha
@@ -150,6 +152,7 @@ pub fn show_tray_menu(
     download_enabled: bool,
     download_visible: bool,
     desktop_avoid: bool,
+    render_mode: RenderMode,
 ) -> u32 {
     unsafe {
         let menu = CreatePopupMenu().unwrap_or_default();
@@ -178,6 +181,16 @@ pub fn show_tray_menu(
             if ghost { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
             MENU_GHOST as usize,
             PCWSTR(w!("Ghost 模式(悬停显现)").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            if render_mode == RenderMode::AcrylicBackdrop {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING | MF_UNCHECKED
+            },
+            MENU_RENDER_MODE as usize,
+            PCWSTR(w!("渲染模式: 亚克力").as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_STRING, MENU_SWEEP as usize, PCWSTR(w!("立即整理桌面").as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());

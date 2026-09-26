@@ -6,8 +6,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateRectRgn, DeleteDC, DeleteObject, SelectClipRgn,
-    SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
 };
 use windows::Win32::Graphics::GdiPlus::{
     GdipAddPathArc, GdipAddPathEllipse, GdipClosePathFigure, GdipCreateFont,
@@ -31,6 +31,7 @@ use crate::utils::wstr;
 use super::geometry::{
     cell_h, font_label, font_title, icon, label_h, margin, rail, title_h, FONT_NAME,
 };
+use super::dcomp;
 use super::grid::{grid_dims, start_page_anim, step_page_anim, total_pages};
 use super::Fence;
 
@@ -105,6 +106,37 @@ fn ensure_cache(f: &mut Fence, w: i32, h: i32) -> *mut u8 {
         }
     }
     f.cache.as_ref().map_or(std::ptr::null_mut(), |c| c.bits)
+}
+
+/// 取/建亚克力模式的内容载体(DirectComposition 表面)。尺寸不匹配则换表面;
+/// 失败返回 false(本帧无内容可提交,窗口保持上一帧/材质原样)。
+fn ensure_backdrop(f: &mut Fence, w: i32, h: i32) -> bool {
+    match &mut f.backdrop {
+        Some(b) => {
+            if b.size() == (w, h) {
+                return true;
+            }
+            if b.resize(w, h) {
+                return true;
+            }
+            // 重建失败:丢弃载体,下帧按新建重试(避免每帧都走失败路径)
+            f.backdrop = None;
+            false
+        }
+        None => match dcomp::Backdrop::attach(f.hwnd, w, h) {
+            Ok(b) => {
+                f.backdrop = Some(b);
+                true
+            }
+            Err(e) => {
+                crate::dlog(&format!(
+                    "[acrylic] composition 挂载失败 hwnd=0x{:x} {w}x{h}: {e:?}",
+                    f.hwnd.0 as usize
+                ));
+                false
+            }
+        },
+    }
 }
 
 /// 把预乘 alpha 的缓存整幅提交(UpdateLayeredWindow)。逐像素 alpha:
@@ -342,23 +374,34 @@ unsafe fn draw_page_dots(g: *mut GpGraphics, f: &Fence, w: i32, h: i32) {
     }
 }
 
-/// 渲染一帧:背景每像素透明度(opacity)+ 幽灵淡出(global),画进缓存并 ULW 整幅提交。
-/// 半透明像素真透明透出桌面,内容画满矩形,圆角由 DWM 裁。
+/// 渲染一帧。分层:背景每像素透明度(opacity)+ 幽灵淡出(global),画进缓存并 ULW 整幅提交
+/// (半透明像素真透明透出桌面,圆角由 DWM 裁)。
+/// 亚克力:不画背景(整块透系统材质)、忽略 ghost/opacity(取舍:常亮),内容同样画进
+/// 缓存 DIB(全不透明 ⇒ 预乘无副作用),再整幅进 DComp 表面。
 pub fn render_fence(icons: &mut crate::icons::IconCache, ghost_mode: bool, f: &mut Fence) {
     let w = f.cfg.w;
     let h = f.cfg.h;
     if w <= 0 || h <= 0 || f.hwnd.is_invalid() {
         return;
     }
-    // 幽灵态(未悬停):整体 alpha 缩到 16%(逐像素 alpha 直接透出桌面,无需开关背景)。
-    let ghost_active = ghost_mode && !f.hover_visible;
-    let bg_alpha = (255.0 * f.cfg.opacity.clamp(0.1, 1.0)) as u8;
-    let mut global = 255u8;
-    if ghost_active {
-        global = (255.0 * 0.16) as u8;
-    }
+    let acrylic = crate::with_global(|g| {
+        g.config.render_mode == crate::config::RenderMode::AcrylicBackdrop
+    });
+    // 分层:幽灵态(未悬停)整体 alpha 缩到16%(逐像素 alpha 直接透出桌面)。
+    // 亚克力:逐像素 alpha 不可用 → ghost/透明度不生效(必要取舍,菜单不改动)。
+    let (bg_alpha, global) = if acrylic {
+        (255u8, 255u8)
+    } else {
+        let ghost_active = ghost_mode && !f.hover_visible;
+        let bg_alpha = (255.0 * f.cfg.opacity.clamp(0.1, 1.0)) as u8;
+        let mut global = 255u8;
+        if ghost_active {
+            global = (255.0 * 0.16) as u8;
+        }
+        (bg_alpha, global)
+    };
     // 直接绘制+提交(不走 WM_PAINT;直接用 f,不查表——创建时 fence 还没进全局列表)
-    if let Some(sample) = paint_core(icons, f, bg_alpha, global) {
+    if let Some(sample) = paint_core(icons, f, bg_alpha, global, acrylic) {
         crate::perf::record_render(f.cfg.id, f.animating, sample);
     }
 }
@@ -384,13 +427,15 @@ pub(crate) fn continue_perf_animation(f: &mut Fence) -> bool {
     true
 }
 
-/// 核心绘制:画进每栅栏缓存 DIB(GDI+ 文字/图形 + GDI 图标),预乘 alpha 后
-/// UpdateLayeredWindow 整幅提交。半透明像素真透明透出桌面,内容画满矩形,圆角由 DWM 裁。
+/// 核心绘制。分层:画进每栅栏缓存 DIB(GDI+ 文字/图形 + GDI 图标)→ 预乘 alpha →
+/// ULW 整幅提交(半透明像素真透明透出桌面,圆角由 DWM 裁)。
+/// 亚克力:同一块缓存 DIB,背景不画(整块透系统材质);预乘后走 DComp 表面,不走 ULW。
 fn paint_core(
     icons: &mut crate::icons::IconCache,
     f: &mut Fence,
     bg_alpha: u8,
     global: u8,
+    acrylic: bool,
 ) -> Option<crate::perf::RenderSample> {
     let w = f.cfg.w;
     let h = f.cfg.h;
@@ -409,28 +454,36 @@ fn paint_core(
         let _ = icons.take_perf_stats();
     }
     unsafe {
-        // 取/建缓存 DIB(尺寸不变则复用,避免每次重建);bits 为空 = 创建失败
+        // 目标 DC:两种模式都画进每栅栏缓存 DIB(复用 + 清成全透明重画)——
+        // 分层 → UpdateLayeredWindow 整幅提交;亚克力 → 整幅 BitBlt 进 DComp 表面。
         let cache_started = profiling.then(Instant::now);
-        let bits = ensure_cache(f, w, h);
-        sample.ensure_cache = cache_started
-            .map(|started| started.elapsed())
-            .unwrap_or_default();
-        if bits.is_null() {
+        let (dc, bits) = {
+            let bits = ensure_cache(f, w, h);
+            sample.ensure_cache = cache_started
+                .map(|started| started.elapsed())
+                .unwrap_or_default();
+            if bits.is_null() {
+                return None;
+            }
+            let memdc = match f.cache.as_ref() {
+                Some(c) => c.mdc,
+                None => return None,
+            };
+            // 整幅清成全透明(0),重画当前帧
+            let clear_started = profiling.then(Instant::now);
+            std::ptr::write_bytes(bits, 0, (w as usize) * (h as usize) * 4);
+            sample.clear = clear_started
+                .map(|started| started.elapsed())
+                .unwrap_or_default();
+            (memdc, bits)
+        };
+        // 亚克力:确保内容载体存在且与当前尺寸一致(首次渲染挂载 / 缩放后重建)
+        if acrylic && !ensure_backdrop(f, w, h) {
             return None;
         }
-        let memdc = match f.cache.as_ref() {
-            Some(c) => c.mdc,
-            None => return None,
-        };
-        // 整幅清成全透明(0),重画当前帧
-        let clear_started = profiling.then(Instant::now);
-        std::ptr::write_bytes(bits, 0, (w as usize) * (h as usize) * 4);
-        sample.clear = clear_started
-            .map(|started| started.elapsed())
-            .unwrap_or_default();
         let gdi_plus_started = profiling.then(Instant::now);
         let mut gfx: *mut GpGraphics = std::ptr::null_mut();
-        if GdipCreateFromHDC(memdc, &mut gfx).0 != 0 {
+        if GdipCreateFromHDC(dc, &mut gfx).0 != 0 {
             return None;
         }
         GdipSetSmoothingMode(gfx, SmoothingModeAntiAlias);
@@ -440,9 +493,11 @@ fn paint_core(
         // 本帧按窗口所在显示器 DPI 缩放几何(Per-Monitor)
         let d = f.dpi;
 
-        // 半透明深色面板:分层窗口走逐像素 alpha,ULW 整幅提交,半透明像素直接透出
+        // 半透明深色面板(仅分层):走逐像素 alpha,ULW 整幅提交,半透明像素直接透出
         // 桌面(真透明,无磨砂)。面板 = 透明度随 bg_alpha 缩放的深色盖层。
-        {
+        // 亚克力:不画背景 — 整块留给系统材质;且 GDI+ 半透明会与白色窗口表面混合
+        // (POC 实测,叠不到 backdrop 上),画了反而难看。
+        if !acrylic {
             let tint_a = ((bg_alpha as u32) * 170) / 255;
             let mut bg_brush: *mut GpSolidFill = std::ptr::null_mut();
             GdipCreateSolidFill((tint_a << 24) | 0x001A1C20, &mut bg_brush);
@@ -649,24 +704,25 @@ fn paint_core(
         let cbot = ctop + grid_rows.max(0) * cell_h(f);
         let rgn = CreateRectRgn(0, ctop, w, cbot);
         if !rgn.is_invalid() {
-            SelectClipRgn(memdc, Some(rgn));
+            SelectClipRgn(dc, Some(rgn));
             for (ix, iy, hicon) in &icons_to_draw {
-                let _ = DrawIconEx(memdc, *ix, *iy, *hicon, icol, icol, 0, None, DI_NORMAL);
+                let _ = DrawIconEx(dc, *ix, *iy, *hicon, icol, icol, 0, None, DI_NORMAL);
             }
-            SelectClipRgn(memdc, None);
+            SelectClipRgn(dc, None);
             let _ = DeleteObject(HGDIOBJ(rgn.0));
         } else {
             for (ix, iy, hicon) in &icons_to_draw {
-                let _ = DrawIconEx(memdc, *ix, *iy, *hicon, icol, icol, 0, None, DI_NORMAL);
+                let _ = DrawIconEx(dc, *ix, *iy, *hicon, icol, icol, 0, None, DI_NORMAL);
             }
         }
         sample.gdi_icons = gdi_icons_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
 
-        // GDI+ 输出的是直通(straight)alpha,而 AlphaBlend 的 AC_SRC_ALPHA 要求
-        // 颜色已按 alpha 预乘。逐像素转预乘(同时乘上 global 做幽灵淡出),否则半透明像素
-        // 会被按预乘假定错误合成 → 图标透明处/圆角边缘出现色块、发暗。
+        // GDI+ 输出的是直通(straight)alpha,而 AlphaBlend 的 AC_SRC_ALPHA 与 DComp 表面的
+        // DXGI_ALPHA_MODE_PREMULTIPLIED 都要求颜色已按 alpha 预乘。逐像素转预乘(同时乘上
+        // global 做幽灵淡出;亚克力模式 global 恒 255,这一步就是纯预乘),否则半透明像素会
+        // 被按预乘假定错误合成 → 图标透明处/圆角边缘出现色块、发暗。
         let premultiply_started = profiling.then(Instant::now);
         let px = bits as *mut u32;
         let n = (w as usize) * (h as usize);
@@ -688,13 +744,20 @@ fn paint_core(
             .map(|started| started.elapsed())
             .unwrap_or_default();
 
-        // 提交:UpdateLayeredWindow 整幅替换窗口表面。透明像素透出桌面(真透明),
-        // 不透明像素直接显示——没有磨砂,内容移动也不会留残影。缓存保留供重建。
-        let ulw_started = profiling.then(Instant::now);
-        if let Some(c) = &f.cache {
+        // 提交:两种模式都是"整幅替换",内容移动不留残影(见 dcomp 模块头注释)。
+        let submit_started = profiling.then(Instant::now);
+        if acrylic {
+            // 亚克力:整幅 BitBlt 进 DirectComposition 表面。表面是逐像素预乘 alpha,
+            // DWM 系统材质在透明处原样透出(重定向表面做不到 —— 那正是"不透明"的成因)。
+            if let (Some(b), Some(c)) = (&f.backdrop, &f.cache) {
+                b.submit(c.mdc, w, h);
+            }
+        } else if let Some(c) = &f.cache {
+            // 分层:UpdateLayeredWindow 整幅替换窗口表面。透明像素透出桌面(真透明),
+            // 不透明像素直接显示——没有磨砂,内容移动也不会留残影。缓存保留供重建。
             submit_ulw(f.hwnd, c);
         }
-        sample.update_layered_window = ulw_started
+        sample.update_layered_window = submit_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
         sample.total = total_started

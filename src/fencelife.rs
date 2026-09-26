@@ -248,6 +248,7 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
     // 之前 EnumWindows + SendMessageW(0x052C) 在 Progman 无响应时会卡死主线程
     let download_id = g.config.download_box_id;
     let download_shown = g.config.download_enabled && g.config.download_box_visible;
+    let acrylic = g.config.render_mode == config::RenderMode::AcrylicBackdrop;
     for f in g.fences.iter_mut() {
         let intentionally_hidden = download_id == Some(f.cfg.id) && !download_shown;
         if f.valid && !g.zen && !intentionally_hidden {
@@ -285,7 +286,14 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
         // 周期回位:任何原因把栅栏从桌面层顶起时,3s 内插回桌面层之上。
         // 用 desktop_insert_host(Progman 之后)而非 HWND_BOTTOM ——
         // HWND_BOTTOM 会把窗口压进 Progman 之下的 DWM 隐藏区域(不可见)。
-        if f.valid {
+        //
+        // 亚克力模式跳过这一发:亚克力窗口必须带 WS_CAPTION(材质硬条件),DWM 因此给它
+        // 挂了系统阴影,而 z 序每变一次 DWM 就重合成一次 frame —— 用户看到的就是"阴影
+        // 每隔几秒闪一下"。这发是**无条件** SetWindowPos,每 3s 把整组栅栏在同一锚点上方
+        // 重插一遍(组内顺序被整个翻过来),跟 desktop_layer_tick 的锚链来回打架,churn
+        // 就是从这来的。分层模式没有 frame,同样的 churn 看不出来,原样保留。
+        // 亚克力模式的层级交给 150ms 的 desktop_layer_tick(它只在 z 序真的错了才动手)。
+        if f.valid && !acrylic {
             if let Some(host) = utils::desktop_insert_host() {
                 unsafe {
                     let _ = SetWindowPos(

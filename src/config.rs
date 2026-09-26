@@ -14,6 +14,17 @@ pub enum FenceKind {
     Download,
 }
 
+/// 窗口渲染模式(全局,切换时重建全部栅栏):
+/// - LayeredAlpha(默认):分层窗口 + ULW 逐像素 alpha(现状,ghost/透明度可用)
+/// - AcrylicBackdrop:非分层窗口 + DWM 系统亚克力(ghost/透明度不生效 — 必要取舍)
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderMode {
+    #[default]
+    LayeredAlpha,
+    AcrylicBackdrop,
+}
+
 fn legacy_fence_kind() -> FenceKind {
     FenceKind::Legacy
 }
@@ -133,6 +144,9 @@ pub struct Config {
     /// 就近搬到空闲网格(默认关闭;开启会关闭 Explorer 的自动排列)。
     #[serde(default)]
     pub desktop_avoid: bool,
+    /// 渲染模式。旧配置缺省 = 分层 ULW(现状行为)。
+    #[serde(default)]
+    pub render_mode: RenderMode,
     #[serde(default)]
     pub version: u32,
 }
@@ -152,6 +166,7 @@ impl Default for Config {
             title_font_size: default_title_font_size(),
             zen_hotkey: default_zen_hotkey(),
             desktop_avoid: false,
+            render_mode: RenderMode::default(),
             version: 3,
         }
     }
@@ -188,6 +203,27 @@ pub fn scale_extent_for_dpi(value: i32, saved_dpi: u32, current_dpi: u32) -> i32
     // v1 没有保存 DPI;把未知值视为当前窗口 DPI可原样保留旧物理尺寸。
     let from = if saved_dpi == 0 { current_dpi } else { saved_dpi }.max(1) as f64;
     ((value as f64 * current_dpi.max(1) as f64) / from).round() as i32
+}
+
+#[cfg(test)]
+mod render_mode_tests {
+    use super::*;
+
+    #[test]
+    fn missing_render_mode_defaults_to_layered_and_roundtrips() {
+        // 旧配置没有 render_mode 字段 → 分层 ULW(现状行为)
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.render_mode, RenderMode::LayeredAlpha);
+
+        let c2 = Config {
+            render_mode: RenderMode::AcrylicBackdrop,
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&c2).unwrap();
+        assert!(json.contains("acrylic_backdrop"));
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.render_mode, RenderMode::AcrylicBackdrop);
+    }
 }
 
 #[cfg(test)]
