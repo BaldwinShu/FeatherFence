@@ -52,14 +52,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW, WS_POPUP,
 };
 
-use config::{Config, FenceCfg, FenceKind};
+use config::{Config, FenceCfg, FenceKind, RenderMode};
 use fence::Fence;
 use hotkey::{ParsedHotKey, RegisteredHotKey, parse_hotkey};
 use tray::{
     WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DESKTOP_AVOID, MENU_DESKTOP_ROLLBACK,
     MENU_DOWNLOAD_ENABLED, MENU_DOWNLOAD_VISIBLE, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX,
-    MENU_NEW_PORTAL, MENU_RELOAD, MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, MENU_ZEN_HOTKEY,
-    add_tray, make_tray_icon, remove_tray, show_tray_menu,
+    MENU_NEW_PORTAL, MENU_RENDER_MODE, MENU_RELOAD, MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN,
+    MENU_ZEN_HOTKEY, add_tray, make_tray_icon, notify_tip, remove_tray, show_tray_menu,
 };
 use utils::wstr;
 
@@ -368,6 +368,7 @@ unsafe extern "system" fn msg_wndproc(
                 download_enabled,
                 download_visible,
                 desktop_avoid,
+                render_mode,
             ) = with_global(|g| {
                 (
                     g.zen,
@@ -377,6 +378,7 @@ unsafe extern "system" fn msg_wndproc(
                     g.config.download_enabled,
                     g.config.download_box_visible,
                     g.config.desktop_avoid,
+                    g.config.render_mode,
                 )
             });
             let cmd = show_tray_menu(
@@ -388,6 +390,7 @@ unsafe extern "system" fn msg_wndproc(
                 download_enabled,
                 download_visible,
                 desktop_avoid,
+                render_mode,
             );
             dispatch_menu(cmd);
         } else if action == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK as u32 {
@@ -450,6 +453,50 @@ unsafe extern "system" fn msg_wndproc(
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// 销毁全部栅栏窗口并按 g.config.fences 重建(渲染模式切换 / 重新加载配置共用)。
+/// 前置:g.config 已就绪;内部先把监听裁到进程级,避免销毁期间收到刷新。
+fn rebuild_all_fences(g: &mut Global) {
+    // 保留进程级监听(桌面清扫和 Downloads 接管);先停止所有栅栏监听,
+    // 避免窗口销毁期间仍收到刷新。
+    g.watchers
+        .retain(|watcher| watcher.owner == WatcherOwner::Process);
+    // 先销毁全部旧窗口(避免持借用调用 DestroyWindow)
+    let hwnds: Vec<HWND> = g.fences.iter().filter(|f| f.valid).map(|f| f.hwnd).collect();
+    for h in hwnds {
+        unsafe {
+            let _ = windows::Win32::System::Ole::RevokeDragDrop(h);
+            let _ = DestroyWindow(h);
+        }
+    }
+    g.fences.clear(); // Fence 析构 → 各自目录监听自动停止 + 亚克力载体释放
+    g.droptargets.clear();
+    // 这里**故意不卸载亚克力设备**:实测卸载后重建每次要漏 ≈23MB/950 句柄/20 线程,
+    // 而设备活着时反复建拆载体零代价 —— 详见 fence::dcomp 里 DEVICE 的注释。
+    // 与启动恢复一致:重复/缺失 id 重新分配,保证按 id 刷新全部生效
+    let mut seen = std::collections::HashSet::new();
+    for cfg in g.config.fences.clone() {
+        let mut c = cfg;
+        if c.id == 0 || !seen.insert(c.id) {
+            c.id = g.next_id;
+            g.next_id += 1;
+        }
+        create_fence(g, c);
+    }
+    ensure_download_box(g);
+    apply_visibility(g);
+}
+
+/// 亚克力(DWMWA_SYSTEMBACKDROP_TYPE)需要 Win11 22H2(build 22621)+;
+/// 读 CurrentBuildNumber 预检,不足则拒绝切换,避免创建出未绘制白窗。
+fn acrylic_supported() -> bool {
+    winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("CurrentBuildNumber").ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .is_some_and(|b| b >= 22621)
 }
 
 fn dispatch_menu(cmd: u32) {
@@ -579,6 +626,34 @@ fn dispatch_menu(cmd: u32) {
                 }
             });
         }
+        MENU_RENDER_MODE => {
+            let unsupported = with_global(|g| {
+                let to_acrylic = g.config.render_mode == RenderMode::LayeredAlpha;
+                // 切到亚克力前预检系统版本:无 DWMWA_SYSTEMBACKDROP_TYPE 的机器上
+                // 会创建出"未绘制白窗",直接拒绝切换。
+                if to_acrylic && !acrylic_supported() {
+                    return true;
+                }
+                g.config.render_mode = if to_acrylic {
+                    RenderMode::AcrylicBackdrop
+                } else {
+                    RenderMode::LayeredAlpha
+                };
+                // 先落盘当前几何,再按新模式重建全部栅栏
+                g.config.fences = fence::config_snapshot(&g.fences);
+                config::save(&g.config);
+                rebuild_all_fences(g);
+                false
+            });
+            if unsupported {
+                let hwnd = with_global(|g| g.msg_hwnd);
+                notify_tip(
+                    hwnd,
+                    "无法启用亚克力",
+                    "需要 Windows 11 22H2(build 22621)及以上",
+                );
+            }
+        }
         MENU_SWEEP => {
             let _ = unsafe { PostMessageW(
                 Some(with_global(|g| g.msg_hwnd)),
@@ -640,32 +715,7 @@ fn dispatch_menu(cmd: u32) {
             fence::set_title_font_px(c.title_font_size);
             with_global(|g| {
                 g.config = c;
-                // 保留进程级监听（桌面清扫和 Downloads 接管）；先停止所有栅栏监听，
-                // 避免窗口销毁期间仍收到刷新。
-                g.watchers
-                    .retain(|watcher| watcher.owner == WatcherOwner::Process);
-                // 先销毁全部旧窗口(避免持借用调用 DestroyWindow)
-                let hwnds: Vec<HWND> = g.fences.iter().filter(|f| f.valid).map(|f| f.hwnd).collect();
-                for h in hwnds {
-                    unsafe {
-                        let _ = windows::Win32::System::Ole::RevokeDragDrop(h);
-                        let _ = DestroyWindow(h);
-                    }
-                }
-                g.fences.clear(); // Fence 析构 → 各自目录监听自动停止
-                g.droptargets.clear();
-                // 与启动恢复一致:重复/缺失 id 重新分配,保证按 id 刷新全部生效
-                let mut seen = std::collections::HashSet::new();
-                for cfg in g.config.fences.clone() {
-                    let mut c = cfg;
-                    if c.id == 0 || !seen.insert(c.id) {
-                        c.id = g.next_id;
-                        g.next_id += 1;
-                    }
-                    create_fence(g, c);
-                }
-                ensure_download_box(g);
-                apply_visibility(g);
+                rebuild_all_fences(g);
             });
         }
         MENU_CONFIG_DIR => {

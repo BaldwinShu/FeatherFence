@@ -6,6 +6,7 @@
 // 本文件是 fence 模块树入口:只留类型/常量 + 对外重导出。
 // 职责分放子模块(geometry/render/grid/refresh/window/menu),行为与拆前一致。
 
+pub mod dcomp;
 mod geometry;
 mod grid;
 mod menu;
@@ -185,8 +186,11 @@ pub struct Fence {
     pub drag_down: (i32, i32),
     /// 目录监听线程与窗口消息之间的刷新合并信号。
     pub refresh_signal: RefreshSignal,
-    /// 已渲染 DIB 缓存:ULW 整幅提交的源(内容不保留,必须自己存)
+    /// 已渲染 DIB 缓存:整幅提交的源(内容不保留,必须自己存)。
+    /// 分层 = UpdateLayeredWindow 提交;亚克力 = BitBlt 进 DirectComposition 表面。
     cache: Option<RenderCache>,
+    /// 亚克力模式的内容载体(DirectComposition 表面);分层模式恒为 None
+    backdrop: Option<dcomp::Backdrop>,
     pub valid: bool,
 }
 
@@ -215,6 +219,7 @@ impl Fence {
             drag_down: (0, 0),
             refresh_signal: RefreshSignal::default(),
             cache: None,
+            backdrop: None,
             valid: true,
         }
     }

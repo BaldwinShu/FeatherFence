@@ -1,14 +1,17 @@
 // 栅栏窗口:创建(分层窗口)+ fence_wndproc 消息循环(拖动/缩放/翻页/删除/重命名)。
+use std::cell::Cell;
 use std::mem::size_of;
 use std::path::PathBuf;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmExtendFrameIntoClientArea, DwmFlush, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWMSBT_TRANSIENTWINDOW, DWM_SYSTEMBACKDROP_TYPE,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, PAINTSTRUCT};
-use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TrackMouseEvent, VK_DELETE, TME_LEAVE,
     TRACKMOUSEEVENT, TRACKMOUSEEVENT_FLAGS,
@@ -19,19 +22,19 @@ use windows::Win32::UI::Shell::{
     FOF_NOERRORUI, FO_DELETE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetCursorPos, GetSystemMetrics, GetWindowRect, LoadCursorW,
-    PostMessageW, RegisterClassW, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow,
-    CS_DBLCLKS, HTCLIENT, IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
-    IDC_SIZEALL, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SC_MINIMIZE, SIZE_MINIMIZED, WNDCLASSW,
-    WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
-    WM_SYSCOMMAND, WM_TIMER, WM_DISPLAYCHANGE, WM_DPICHANGED, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_POPUP,
+    CreateWindowExW, DefWindowProcW, GetCursorPos, GetSystemMetrics, GetWindowRect, KillTimer,
+    LoadCursorW, PostMessageW, RegisterClassW, SendMessageW, SetCursor, SetForegroundWindow,
+    SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, HTCLIENT, IDC_ARROW, IDC_SIZENESW, IDC_SIZENS,
+    IDC_SIZENWSE, IDC_SIZEWE, IDC_SIZEALL, SM_CXDRAG, SM_CYDRAG, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SC_MINIMIZE,
+    SIZE_MINIMIZED, WNDCLASSW, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
+    WM_SYSCOMMAND, WM_TIMER, WM_DISPLAYCHANGE, WM_DPICHANGED, WS_CAPTION, WS_EX_LAYERED,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
-use crate::config::{scale_extent_for_dpi, FenceCfg};
+use crate::config::{scale_extent_for_dpi, FenceCfg, RenderMode};
 use crate::utils::{work_area, wstr};
 use crate::{with_global, Global};
 
@@ -62,6 +65,94 @@ fn enable_round(hwnd: HWND) {
         );
     }
 }
+/// 亚克力触发定时器(一次性,500ms 后补打)。避开 ANIM_TICK=0xFE10 / REFRESH_TICK=0xFE11。
+const BACKDROP_NUDGE_TICK: usize = 0xFE12;
+
+/// 触发链里每次 `DwmExtendFrameIntoClientArea` 之后必须补的一发:POC 配方里就在,
+/// 移植时漏了。`SWP_FRAMECHANGED` 才让 USER32 失效窗口的非客户区缓存、重算 frame,
+/// 没有它 DWM 侧看不到这次 margins 变化 —— 材质建立不起来(实测就是"纯色回退填充")。
+fn frame_change(hwnd: HWND) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE,
+        );
+    }
+}
+
+thread_local! {
+    /// WM_NCACTIVATE 重声明的重入保护:内层那发 SendMessageW 会再次进入本分支
+    static NCACTIVATE_REASSERTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 当前是否亚克力渲染模式(全局配置)。
+fn acrylic_mode() -> bool {
+    with_global(|g| g.config.render_mode == RenderMode::AcrylicBackdrop)
+}
+
+/// 亚克力触发链(POC 验证配方):fresh 初设永不渲染 — extend 取值本身无关,必须发生
+/// 一次 margins 值变化(-1→0)才触发 DWM 重建客户区材质;建立后锁存、失焦不退化。
+/// 创建时连打两发 + BACKDROP_NUDGE_TICK 在 500ms(首次合成后)补第三发,覆盖时序假设。
+/// 顺序与 POC 一致:先设材质类型,再打 delta;每次 extend 后 frame_change,末尾 DwmFlush
+/// 等一次合成(缺这三样中的任何一样,POC 里都观察不到材质)。
+fn apply_acrylic_backdrop(hwnd: HWND) {
+    unsafe {
+        let bd = DWMSBT_TRANSIENTWINDOW;
+        let attr = match DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &bd as *const DWM_SYSTEMBACKDROP_TYPE as *const _,
+            size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
+        ) {
+            Ok(()) => "ok".to_string(),
+            Err(e) => format!("ERR {e:?}"),
+        };
+        let m1 = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let m0 = MARGINS {
+            cxLeftWidth: 0,
+            cxRightWidth: 0,
+            cyTopHeight: 0,
+            cyBottomHeight: 0,
+        };
+        let e1 = DwmExtendFrameIntoClientArea(hwnd, &m1).is_ok();
+        frame_change(hwnd);
+        let e2 = DwmExtendFrameIntoClientArea(hwnd, &m0).is_ok();
+        frame_change(hwnd);
+        let flushed = DwmFlush().is_ok();
+        // 材质跟随窗口深浅色:系统在浅色模式下给的是浅色亚克力,而这套皮肤的面板
+        // 本来就是深色(#1A1C20),必须显式压成深色材质(PowerToys 同款)。
+        let dark = windows::core::BOOL(1);
+        let dark_attr = match DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const _ as *const _,
+            size_of::<windows::core::BOOL>() as u32,
+        ) {
+            Ok(()) => "ok".to_string(),
+            Err(e) => format!("ERR {e:?}"),
+        };
+        // **关键**:DWM 会把"非激活"窗口的材质压平成一块实色(活模糊只给激活窗口),
+        // 而栅栏从不被激活 —— 所以材质永远是那块灰色。这一发让它"只为渲染"按激活窗口
+        // 画材质,不抢真实焦点、不改变任何交互(PowerToys 同款修法)。
+        let _ = SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+        // 全程留痕:区分"触发链没执行/API失败"与"执行了但系统不渲染"
+        crate::dlog(&format!(
+            "[acrylic] trigger hwnd=0x{:x} attr={attr} dark={dark_attr} extend(-1)={e1} extend(0)={e2} flush={flushed}",
+            hwnd.0 as usize
+        ));
+    }
+}
+
 pub fn register_class() {
     unsafe {
         let wc = WNDCLASSW {
@@ -85,14 +176,31 @@ pub fn register_class() {
 pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
     unsafe {
         let title_w = wstr(&cfg.title);
+        // 亚克力模式 = 非分层窗口 + 系统材质(触发链见 apply_acrylic_backdrop);
+        // 分层模式(现状)保持 WS_EX_LAYERED + ULW 管线,零改动。
+        let acrylic = acrylic_mode();
         let r = CreateWindowExW(
-            // 分层窗口 + ULW 整幅提交:逐像素 alpha,半透明面板真透明透出桌面。
-            // 圆角由 DWM 裁(DWMWCP_ROUND 对分层窗口同样生效)。
+            // 分层:逐像素 alpha,半透明面板真透明透出桌面;圆角由 DWM 裁。
+            // 亚克力:不带 WS_EX_LAYERED(分层与系统材质互斥),内容全部走 DirectComposition
+            // 表面(见 fence::dcomp)。WS_EX_NOREDIRECTIONBITMAP 让窗口不再有重定向表面 ——
+            // 那块表面是 GDI 画布,会把半透明像素混成不透明(用户报告的"没有,不透明"),
+            // 也盖住 DWM 材质;DComp-only 窗口(Chromium 同款)不能留着它。
             // 启动时用 SW_SHOWNA 避免抢焦点；用户点击后允许激活，才能接收 Delete。
-            WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            if acrylic {
+                WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP
+            } else {
+                WS_EX_TOOLWINDOW | WS_EX_LAYERED
+            },
             w!("FeatherFence"),
             PCWSTR(title_w.as_ptr()),
-            WS_POPUP,
+            // 亚克力必须带 WS_CAPTION:DWM 只对"有框"的窗口合成系统材质,光秃秃的
+            // WS_POPUP 会被静默忽略(材质永远不出来)。外观仍无边框 —— WM_NCCALCSIZE
+            // 返回 0 把非客户区收成 0(PowerToys 同款修法)。分层模式维持 WS_POPUP。
+            if acrylic {
+                WS_POPUP | WS_CAPTION
+            } else {
+                WS_POPUP
+            },
             cfg.x,
             cfg.y,
             cfg.w,
@@ -110,12 +218,21 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             }
         };
         if !hwnd.is_invalid() {
-            // 插到桌面层之上(Progman 之后):栅栏位于桌面背景之上、图标层/普通窗口之下。
-            // 不用 HWND_BOTTOM:实测会把窗口压到 Progman 之下的 DWM 隐藏区域,
-            // 窗口不可见且 FindWindow/EnumWindows 都枚举不到。
-            // 不挂 Progman 作父窗口(分层窗口+高 alpha+Progman 父窗口会触发 DWM
-            // 命中测试 bug,导致窗口可见但点不到拖不动)。
-            if let Some(host) = crate::utils::desktop_insert_host() {
+            if acrylic {
+                apply_acrylic_backdrop(hwnd);
+            }
+            // 插层(R1 实验,只动亚克力):
+            // - 分层(现状):Progman 之上、图标列表层之下 —— 保持原 z 序,零改动。
+            //   不用 HWND_BOTTOM(会压到 Progman 之下 DWM 隐藏区域);不挂 Progman 父窗口
+            //   (分层+高 alpha+Progman 父窗口触发 DWM 命中测试 bug)。
+            // - 亚克力:插到全屏图标列表层(SysListView32)之上 —— 疑似栅栏被该全屏窗口
+            //   盖住 → DWM 跳过 backdrop 渲染(白面);POC 中"被 ULW 全盖=白"同机制。
+            let z_anchor = if acrylic {
+                crate::utils::find_desktop_listview()
+            } else {
+                crate::utils::desktop_insert_host()
+            };
+            if let Some(host) = z_anchor {
                 let _ = SetWindowPos(
                     hwnd,
                     Some(host),
@@ -130,6 +247,11 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             let _ = ShowWindow(hwnd, SW_SHOWNA);
             // 圆角由 DWM 裁
             enable_round(hwnd);
+            if acrylic {
+                // show 之后再打一发 + 500ms 定时器补发(POC 配方:初设不渲染,靠 delta 触发)
+                apply_acrylic_backdrop(hwnd);
+                let _ = SetTimer(Some(hwnd), BACKDROP_NUDGE_TICK, 500, None);
+            }
             // 首帧渲染(画进缓存 + ULW 提交)
             schedule_render(hwnd);
             // 自检:程序自己测命中(对比外部诊断,区分桌面/进程视角问题)
@@ -139,8 +261,13 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             let cy = (rc.top + rc.bottom) / 2;
             let _hit = windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT { x: cx, y: cy });
             crate::dlog(&format!(
-                "[feather] created hwnd=0x{:x} at ({},{},{},{})",
-                hwnd.0 as usize, rc.left, rc.top, rc.right, rc.bottom
+                "[feather] created hwnd=0x{:x} at ({},{},{},{}) mode={}",
+                hwnd.0 as usize,
+                rc.left,
+                rc.top,
+                rc.right,
+                rc.bottom,
+                if acrylic { "acrylic" } else { "layered" }
             ));
         }
         hwnd
@@ -269,6 +396,30 @@ unsafe extern "system" fn fence_wndproc(
             // 背景由我们全量重绘(ULW 整幅替换),不做系统擦除 → 无闪烁
             return LRESULT(1);
         }
+        // DWM 只给"激活"窗口画活模糊,非激活窗口的材质被压平成一块实色。栅栏是常驻
+        // 组件(点一下/点走一次就闪一次灰,不可接受),所以收到失活通知立刻重新声明
+        // "激活" —— 仅影响材质渲染,不改变系统真实的激活窗口、不抢焦点。
+        //
+        // 注意:**激活那一发必须交给 DefWindowProc**。DWM 的激活态是 DefWindowProc 里
+        // 更新的;把它吞掉(return 1)连启动时的材质都建立不起来(踩过)。只有失活那一发
+        // 不能落地,否则窗口又被标成非激活、材质压平。
+        WM_NCACTIVATE if acrylic_mode() => {
+            if wparam.0 == 0 && !NCACTIVATE_REASSERTING.with(|c| c.get()) {
+                NCACTIVATE_REASSERTING.with(|c| c.set(true));
+                let r = SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+                NCACTIVATE_REASSERTING.with(|c| c.set(false));
+                // 若材质已被压平,重走一遍触发链把它拉回活模糊
+                apply_acrylic_backdrop(hwnd);
+                return r;
+            }
+            // 激活/重声明那一发交给 DefWindowProc 并直接返回(不落到函数末尾二次调用)
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        // 亚克力窗带 WS_CAPTION(见 create_window 注释)但不要真的长出标题栏/边框:
+        // 返回 0 让客户区 = 整个窗口。分层模式没有 WS_CAPTION,不拦截,走 DefWindowProc。
+        WM_NCCALCSIZE if acrylic_mode() => {
+            return LRESULT(0);
+        }
         WM_NCHITTEST => {
             // 命中测试统一返回 HTCLIENT:无边框 + WS_EX_NOACTIVATE 下系统拖动/拉伸不可用
             // (实测:点击标题栏 WM_NCLBUTTONDOWN(HTCAPTION) 到达,但 DefWindowProc 不移动窗口)。
@@ -279,10 +430,16 @@ unsafe extern "system" fn fence_wndproc(
         WM_PAINT => {
             // 分层窗口内容不保留:系统发 WM_PAINT 仅用于验证(清空更新区域)。
             // 整幅内容由 render_fence 画进缓存后 UpdateLayeredWindow 提交。
+            // 亚克力窗口内容同样不被系统保留,遮挡/还原后需重绘(画到窗口 DC)。
             let mut ps = PAINTSTRUCT::default();
             unsafe {
                 let _ = BeginPaint(hwnd, &mut ps);
                 let _ = EndPaint(hwnd, &ps);
+            }
+            let acrylic =
+                with_global(|g| g.config.render_mode == RenderMode::AcrylicBackdrop);
+            if acrylic {
+                schedule_render(hwnd);
             }
             return LRESULT(0);
         }
@@ -710,6 +867,14 @@ unsafe extern "system" fn fence_wndproc(
                         }
                     }
                 });
+            } else if wparam.0 == BACKDROP_NUDGE_TICK {
+                // 亚克力:500ms 后(DWM 首次合成完)补打一次触发链,一次性不重臂
+                let _ = KillTimer(Some(hwnd), BACKDROP_NUDGE_TICK);
+                crate::dlog(&format!(
+                    "[acrylic] nudge fired hwnd=0x{:x}",
+                    hwnd.0 as usize
+                ));
+                apply_acrylic_backdrop(hwnd);
             }
             return LRESULT(0);
         }
