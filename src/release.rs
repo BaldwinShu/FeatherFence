@@ -238,6 +238,10 @@ pub(crate) fn plan(g: &Global, cfg: &FenceCfg, folder: &Path, exclude_id: u32) -
     let free = desktop_icons::free_grid_cells(&reserved);
 
     let action = decide(volume_same, free, collision, n);
+    crate::dlog(&format!(
+        "[delete] 判定: n={n} shortcuts={shortcuts} collision={collision} volume_same={volume_same} free={free:?} reserved={} → {action:?}",
+        reserved.len()
+    ));
     Plan {
         title: cfg.title.clone(),
         folder: folder.to_path_buf(),
@@ -250,44 +254,85 @@ pub(crate) fn plan(g: &Global, cfg: &FenceCfg, folder: &Path, exclude_id: u32) -
 /// 执行判定结果。`Ok(())` 后调用方才删除栅栏;`Err` = 保留栅栏
 /// (已移动的条目留在桌面且登记过防回捞,剩余的还在箱里,可见、可重试)。
 pub(crate) fn execute(g: &mut Global, plan: &Plan) -> Result<(), String> {
+    crate::dlog(&format!(
+        "[release] execute {:?} folder={}",
+        plan.action,
+        plan.folder.display()
+    ));
     match &plan.action {
-        ReleaseAction::Keep { .. } => Ok(()),
-        ReleaseAction::MoveFolder { .. } => {
+        ReleaseAction::Keep { reason } => {
+            crate::dlog(&format!("[release] Keep,不动文件({reason})"));
+            Ok(())
+        }
+        ReleaseAction::MoveFolder { reason } => {
             if !plan.folder.exists() {
+                crate::dlog("[release] MoveFolder: 目录已不存在,跳过");
                 return Ok(());
             }
             let desktop = crate::desktop_dir().ok_or("无法获取桌面目录")?;
-            watcher::move_to_dir(&plan.folder, &desktop)
-                .map(|_| ())
-                .map_err(|e| format!("移动收纳箱到桌面失败:{e}"))
+            let r = watcher::move_to_dir(&plan.folder, &desktop)
+                .map(|dest| crate::dlog(&format!(
+                    "[release] MoveFolder 成功 → {}({reason})",
+                    dest.display()
+                )))
+                .map_err(|e| format!("移动收纳箱到桌面失败:{e}"));
+            if let Err(e) = &r {
+                crate::dlog(&format!("[release] MoveFolder 失败: {e}"));
+            }
+            r.map(|_| ())
         }
         ReleaseAction::Release => {
             if !plan.folder.exists() {
+                crate::dlog("[release] Release: 目录已不存在,跳过");
                 return Ok(());
             }
-            let desktop = crate::desktop_dir().ok_or("无法获取桌面目录")?;
-            let entries: Vec<PathBuf> = std::fs::read_dir(&plan.folder)
-                .map(|rd| rd.flatten().map(|e| e.path()).collect())
-                .map_err(|e| format!("读取收纳箱失败:{e}"))?;
+            let Some(desktop) = crate::desktop_dir() else {
+                crate::dlog("[release] Release 失败: 无法获取桌面目录");
+                return Err("无法获取桌面目录".into());
+            };
+            let entries: Vec<PathBuf> = match std::fs::read_dir(&plan.folder) {
+                Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
+                Err(e) => {
+                    crate::dlog(&format!("[release] 读取收纳箱失败: {e}"));
+                    return Err(format!("读取收纳箱失败:{e}"));
+                }
+            };
             if entries.is_empty() {
                 // 对话框期间被清空:算成功,顺手把空目录收掉
-                let _ = std::fs::remove_dir(&plan.folder);
+                let removed = std::fs::remove_dir(&plan.folder).is_ok();
+                crate::dlog(&format!(
+                    "[release] 目录已空(对话框期间被清?),直接成功 remove_dir={removed}"
+                ));
                 return Ok(());
             }
+            crate::dlog(&format!("[release] 逐条放回 {} 条 → {}", entries.len(), desktop.display()));
+            let mut moved = 0usize;
+            let mut suppressed = 0usize;
             for src in entries {
                 // 逐条移动,任一失败即停;已移的必须已登记(见下),否则会被回捞。
-                let dest = watcher::move_to_dir(&src, &desktop)
-                    .map_err(|e| format!("{}:{e}", src.display()))?;
+                let dest = match watcher::move_to_dir(&src, &desktop) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let msg = format!("{}:{e}", src.display());
+                        crate::dlog(&format!("[release] move 失败(中止): {msg}"));
+                        return Err(msg);
+                    }
+                };
+                moved += 1;
                 // 防自动收纳回捞:落桌 .lnk 的变更事件会被 shortcut_tick 当成
                 // "新快捷方式"再收进别的箱。同线程消息泵——这里登记 seen 后,
                 // 事件入队与下次 tick 处理必然排在其后,queue_new 见过即跳过。
                 if shortcut::is_shortcut(&dest) {
                     g.shortcut_seen.insert(dest.clone());
                     g.shortcut_pending.remove(&dest);
+                    suppressed += 1;
                 }
             }
             // 全部移完,空目录收掉;收不掉(有并发新增等)就留着,绝不删内容
-            let _ = std::fs::remove_dir(&plan.folder);
+            let removed = std::fs::remove_dir(&plan.folder).is_ok();
+            crate::dlog(&format!(
+                "[release] 完成: 移出 {moved} 条,登记防回捞 {suppressed} 个,remove_dir={removed}"
+            ));
             Ok(())
         }
     }
