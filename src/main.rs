@@ -22,6 +22,7 @@ mod utils;
 mod watcher;
 mod download;
 mod fencelife;
+mod release;
 mod shortcut;
 mod sweep;
 
