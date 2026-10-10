@@ -10,14 +10,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindowRect, GetWindowTextW, IsDialogMessageW,
-    IsWindow, LoadCursorW, RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow,
-    TrackPopupMenu, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_DBLCLKS,
-    ES_AUTOHSCROLL, HMENU, IDC_ARROW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SW_SHOW,
-    SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage, WM_CLOSE, WM_COMMAND, WM_SETFONT,
+    IsWindow, LoadCursorW, MessageBoxW, RegisterClassW, SendMessageW, SetForegroundWindow,
+    ShowWindow, TrackPopupMenu, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_DBLCLKS, ES_AUTOHSCROLL,
+    HMENU, IDC_ARROW, IDOK, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO,
+    MESSAGEBOX_STYLE, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SW_SHOW, SW_SHOWNORMAL,
+    TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage, WM_CLOSE, WM_COMMAND, WM_SETFONT,
     WINDOW_STYLE, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME,
     WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
+use crate::release::{self, ReleaseAction};
 use crate::utils::wstr;
 use crate::with_global;
 
@@ -139,15 +141,149 @@ pub fn fence_menu(hwnd: HWND) {
         let _ = DestroyMenu(menu);
         let cmd = cmd.0 as u32;
         if cmd == 1001 {
-            with_global(|g| {
-                if let Some(idx) = g.fences.iter().position(|f| f.hwnd == hwnd) {
-                    if g.config.download_box_id == Some(g.fences[idx].cfg.id) {
-                        crate::set_download_enabled(g, false);
-                        return;
-                    }
+            // 删除栅栏。确认框必须在 with_global **之外**:MessageBox 会开嵌套
+            // 消息泵、wndproc 可重入,借用内弹框会 RefCell panic(先例 handle_drop)。
+            enum Pending {
+                /// 已处理完(下载箱关接管/门户解绑/空箱直删),或无需后续
+                Done,
+                /// 待确认。plan=None → 目录被共享,仅解绑
+                Confirm {
+                    fence_id: u32,
+                    text: String,
+                    style: MESSAGEBOX_STYLE,
+                    plan: Option<release::Plan>,
+                },
+            }
+            enum Outcome {
+                /// 已删除且无需额外提示(Release/MoveFolder 的结果肉眼可见)
+                Done,
+                /// 已删除但文件保留在原地 → 托盘提示路径
+                Kept { msg_hwnd: HWND, msg: String },
+                /// 执行失败:中止,栅栏与文件保持原状 → 错误框
+                Failed(String),
+            }
+            // 第 1 段:分类 + 判定(借用内)
+            let pending = with_global(|g| {
+                let Some(idx) = g.fences.iter().position(|f| f.hwnd == hwnd) else {
+                    return Pending::Done;
+                };
+                let id = g.fences[idx].cfg.id;
+                // 下载箱:菜单文案本就是「关闭下载接管」,不删
+                if g.config.download_box_id == Some(id) {
+                    crate::set_download_enabled(g, false);
+                    return Pending::Done;
+                }
+                let cfg = g.fences[idx].cfg.clone();
+                // 门户 / 非自管目录:仅解绑,目录绝不碰(维持现状,零确认)
+                let Some(folder) = release::owned_folder(g, &cfg) else {
                     crate::delete_fence(g, idx);
+                    return Pending::Done;
+                };
+                // 目录不存在或为空 → 零损失直删(空目录顺手收掉,不留孤儿)
+                let non_empty = std::fs::read_dir(&folder)
+                    .map(|rd| rd.flatten().next().is_some())
+                    .unwrap_or(false);
+                if !non_empty {
+                    let _ = std::fs::remove_dir(&folder);
+                    crate::delete_fence(g, idx);
+                    return Pending::Done;
+                }
+                // 被共享(其余栅栏有效目录 / sweep 目标 / 下载箱)→ 仅解绑,确认一次
+                if release::in_use(g, &folder, id) {
+                    return Pending::Confirm {
+                        fence_id: id,
+                        text: format!(
+                            "「{}」的收纳目录仍被其他栅栏或清扫规则使用。\n删除仅移除此栅栏,目录与文件保留原处。是否移除?",
+                            cfg.title
+                        ),
+                        style: MB_YESNO | MB_ICONQUESTION,
+                        plan: None,
+                    };
+                }
+                let plan = release::plan(g, &cfg, &folder, id);
+                let style = if matches!(plan.action, ReleaseAction::Keep { .. }) {
+                    MB_OK | MB_ICONINFORMATION
+                } else {
+                    MB_YESNO | MB_ICONQUESTION
+                };
+                Pending::Confirm {
+                    fence_id: id,
+                    text: plan.dialog_text(),
+                    style,
+                    plan: Some(plan),
                 }
             });
+            // 第 2 段:借用之外确认 → 执行 → 删除
+            if let Pending::Confirm {
+                fence_id,
+                text,
+                style,
+                plan,
+            } = pending
+            {
+                let text_w = wstr(&text);
+                let ret = MessageBoxW(
+                    Some(hwnd),
+                    PCWSTR(text_w.as_ptr()),
+                    w!("FeatherFence - 删除栅栏"),
+                    style,
+                );
+                // MB_YESNO 要求点「是」;MB_OK(Keep 信息框)点掉即继续
+                let confirmed = ret == IDYES || ret == IDOK;
+                if confirmed {
+                    let outcome = with_global(|g| {
+                        // 对话框期间状态可能已变:按 id 重定位,找不到就当已完成
+                        let Some(idx) = g.fences.iter().position(|f| f.cfg.id == fence_id) else {
+                            return Outcome::Done;
+                        };
+                        let Some(plan) = plan else {
+                            // 共享 → 仅解绑
+                            crate::delete_fence(g, idx);
+                            return Outcome::Done;
+                        };
+                        match release::execute(g, &plan) {
+                            Ok(()) => {
+                                if let ReleaseAction::Keep { .. } = plan.action {
+                                    let msg = format!(
+                                        "栅栏已删除;{} 个文件保留在 {}",
+                                        plan.n,
+                                        plan.folder.display()
+                                    );
+                                    let mhwnd = g.msg_hwnd;
+                                    crate::delete_fence(g, idx);
+                                    Outcome::Kept {
+                                        msg_hwnd: mhwnd,
+                                        msg,
+                                    }
+                                } else {
+                                    // 刚放回桌面的图标立即避让归位,不等下个 watchdog 周期
+                                    crate::fencelife::reserve_desktop_icons(g);
+                                    crate::delete_fence(g, idx);
+                                    Outcome::Done
+                                }
+                            }
+                            Err(e) => Outcome::Failed(e),
+                        }
+                    });
+                    match outcome {
+                        Outcome::Done => {}
+                        Outcome::Kept { msg_hwnd, msg } => {
+                            crate::tray::notify_tip(msg_hwnd, "轻栅栏", &msg);
+                        }
+                        Outcome::Failed(e) => {
+                            // 失败:栅栏保留(弹框仍在借用之外)
+                            let detail_w =
+                                wstr(&format!("删除中止,栅栏与文件保持原状。\n\n{e}"));
+                            let _ = MessageBoxW(
+                                Some(hwnd),
+                                PCWSTR(detail_w.as_ptr()),
+                                w!("FeatherFence - 删除栅栏"),
+                                MB_OK | MB_ICONINFORMATION,
+                            );
+                        }
+                    }
+                }
+            }
         } else if matches!(cmd, 1002..=1004 | 1012) {
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
