@@ -27,7 +27,10 @@ use refresh::REFRESH_DEBOUNCE_MS;
 use render::RenderCache;
 
 // 对外 API 重导出:保持 crate::fence::X 全部调用点不变
-pub use geometry::{dpi_scale, min_h, min_w, set_icon_px, set_title_font_px, window_dpi};
+pub use geometry::{
+    dpi_scale, min_h, min_w, set_icon_px, set_thumb_mode, set_title_font_px, thumb_mode,
+    window_dpi,
+};
 pub use grid::{config_snapshot, settle_fence};
 pub(crate) use menu::prompt_text;
 pub use refresh::refresh_entries;

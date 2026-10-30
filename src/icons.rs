@@ -25,6 +25,9 @@ pub struct IconCache {
     map: HashMap<PathBuf, HICON>,
     lru: VecDeque<PathBuf>,
     perf: IconPerfStats,
+    /// 缩略图(视依赖媒体文件时替代图标)。独立存储、独立预算,
+    /// 未命中/不支持的扩展名仍走上面的图标缓存。
+    thumbs: crate::thumbs::ThumbStore,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -99,7 +102,23 @@ impl IconCache {
             map: HashMap::new(),
             lru: VecDeque::new(),
             perf: IconPerfStats::default(),
+            thumbs: crate::thumbs::ThumbStore::new(),
         }
+    }
+
+    /// 缩略图查询:命中直接返回;未命中时排队给后台线程,本帧返回 None(调用方画图标)。
+    pub fn thumb(&mut self, path: &Path, px: i32) -> Option<std::sync::Arc<crate::thumbs::Thumb>> {
+        self.thumbs.get_or_enqueue(path, px)
+    }
+
+    /// 收后台解码结果。返回 true 表示有新缩略图可用,调用方应重绘。
+    pub fn drain_thumbs(&mut self) -> bool {
+        self.thumbs.drain()
+    }
+
+    /// 目录内容变化时作废该目录的缩略图(只动内存,不做 IO)。
+    pub fn forget_thumbs_in(&mut self, dir: &Path) {
+        self.thumbs.forget_dir(dir);
     }
 
     pub fn get(&mut self, path: &Path) -> HICON {
@@ -166,6 +185,7 @@ impl IconCache {
             let _ = unsafe { DestroyIcon(h) };
         }
         self.lru.clear();
+        self.thumbs.clear();
     }
 }
 

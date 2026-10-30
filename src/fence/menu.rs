@@ -23,8 +23,8 @@ use crate::release::{self, ReleaseAction};
 use crate::utils::wstr;
 use crate::with_global;
 
-use super::geometry::{set_icon_px, set_title_font_px};
-use super::grid::{config_snapshot, settle_fence};
+use super::geometry::{set_icon_px, set_thumb_mode, set_title_font_px};
+use super::grid::{config_snapshot, settle_fence, sync_page};
 use super::render::render_fence;
 use super::window::fence_idx;
 
@@ -127,6 +127,10 @@ pub fn fence_menu(hwnd: HWND) {
             title_font_menu.0 as usize,
             PCWSTR(w!("标题字号").as_ptr()),
         );
+        // 缩略图(全局):媒体文件用缩略图替代系统图标
+        let thumb_on = with_global(|g| g.config.thumbnails);
+        let thumb_flags = if thumb_on { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let _ = AppendMenuW(menu, thumb_flags, 1020, PCWSTR(w!("缩略图").as_ptr()));
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let cmd = TrackPopupMenu(
@@ -386,6 +390,21 @@ pub fn fence_menu(hwnd: HWND) {
                 for i in 0..n {
                     settle_fence(g, i);
                 }
+            });
+        } else if cmd == 1020 {
+            with_global(|g| {
+                g.config.thumbnails = !g.config.thumbnails;
+                set_thumb_mode(g.config.thumbnails);
+                // 只切格子大小与绘制,不调 settle:缩略图不该永久改写用户的栅栏尺寸,
+                // 也不该顺带触发一次桌面图标避让搬移。留白由网格整除自然吸收。
+                let ghost = g.config.ghost_mode;
+                for i in 0..g.fences.len() {
+                    if g.fences[i].valid {
+                        sync_page(&mut g.fences[i]);
+                        render_fence(&mut g.icons, ghost, &mut g.fences[i]);
+                    }
+                }
+                crate::config::save(&g.config);
             });
         }
     }

@@ -32,17 +32,28 @@ pub(crate) fn rail(d: f32) -> i32 {
 }
 /// 全局图标尺寸(逻辑像素):所有栅栏统一
 static ICON_PX: AtomicU32 = AtomicU32::new(32);
+/// 缩略图模式:媒体文件用缩略图替代图标。**只换绘制内容,不改网格槽位**——
+/// 缩略图就画在当前图标尺寸上,容量与图标模式完全一致。
+static THUMB_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 全局栅栏标题字号(逻辑像素):所有栅栏统一
 static TITLE_FONT_PX: AtomicU32 = AtomicU32::new(12);
 /// 设置全局图标尺寸(物理显示时再乘 DPI)
 pub fn set_icon_px(v: u32) {
     ICON_PX.store(v.max(16).min(128), AtomicOrdering::Relaxed);
 }
+/// 切换缩略图模式(只影响绘制内容与网格裁剪,**不重排栅栏尺寸**)。
+pub fn set_thumb_mode(on: bool) {
+    THUMB_MODE.store(on, AtomicOrdering::Relaxed);
+}
+pub fn thumb_mode() -> bool {
+    THUMB_MODE.load(AtomicOrdering::Relaxed)
+}
 /// 设置全局栅栏标题字号(物理显示时再乘 DPI)
 pub fn set_title_font_px(v: u32) {
     TITLE_FONT_PX.store(v.clamp(10, 32), AtomicOrdering::Relaxed);
 }
-/// 图标尺寸(物理像素,按所在屏 DPI 缩放);取全局值,0 时回退 32
+/// 图标/缩略图边长(物理像素,按所在屏 DPI 缩放);取全局值,0 时回退 32。
+/// 缩略图模式复用同一尺寸 —— 格子仍是 44×70,容量不变。
 pub(crate) fn icon(f: &Fence) -> i32 {
     let base = ICON_PX.load(AtomicOrdering::Relaxed);
     let base = if base == 0 { 32 } else { base };

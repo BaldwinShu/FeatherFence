@@ -17,6 +17,7 @@ mod hotkey;
 mod icons;
 mod perf;
 mod shellmenu;
+mod thumbs;
 mod tray;
 mod utils;
 mod watcher;
@@ -436,14 +437,32 @@ unsafe extern "system" fn msg_wndproc(
         with_global(|g| sweep_desktop(g));
         return LRESULT(0);
     }
+    // 缩略图工作线程就绪:收取结果,有新图则重绘(下一帧起用缩略图替换图标)
+    if msg == thumbs::WM_APP_THUMB_READY {
+        with_global(|g| {
+            if !g.icons.drain_thumbs() {
+                return;
+            }
+            let ghost = g.config.ghost_mode;
+            for i in 0..g.fences.len() {
+                if g.fences[i].valid {
+                    fence::render_fence(&mut g.icons, ghost, &mut g.fences[i]);
+                }
+            }
+        });
+        return LRESULT(0);
+    }
     // 目录监听按栅栏 id 通知:窗口重建后依然有效(不依赖具体 hwnd)
     if msg == fence::WM_APP_REFRESH_ID {
         let id = wparam.0 as u32;
         with_global(|g| {
             if let Some(idx) = g.fences.iter().position(|f| f.valid && f.cfg.id == id) {
                 let ghost = g.config.ghost_mode;
+                let vault = config::vault_dir(&g.config);
+                let dir = g.fences[idx].cfg.folder.clone().unwrap_or_else(|| vault.clone());
+                g.icons.forget_thumbs_in(&dir);
                 let f = &mut g.fences[idx];
-                fence::refresh_entries(f, &config::vault_dir(&g.config));
+                fence::refresh_entries(f, &vault);
                 fence::render_fence(&mut g.icons, ghost, f);
             }
         });
@@ -826,6 +845,8 @@ fn main() {
         )
         .unwrap_or_default()
     };
+    // 缩略图工作线程只认这个原子句柄(不碰 with_global:深度计数是线程局部的)
+    thumbs::set_notify_hwnd(msg_hwnd);
 
     fence::register_class();
     dlog("[main] class registered");
@@ -870,6 +891,7 @@ fn main() {
         }
     };
     fence::set_icon_px(cfg.icon);
+    fence::set_thumb_mode(cfg.thumbnails);
     fence::set_title_font_px(cfg.title_font_size);
     let vault = config::vault_dir(&cfg);
     let _ = std::fs::create_dir_all(&vault);

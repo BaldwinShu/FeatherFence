@@ -149,6 +149,10 @@ pub struct Config {
     pub render_mode: RenderMode,
     #[serde(default)]
     pub version: u32,
+    /// 缩略图模式:图片/视频用缩略图代替系统图标。
+    /// 缩略图画在当前图标尺寸上,网格槽位与容量不变。
+    #[serde(default = "default_true")]
+    pub thumbnails: bool,
 }
 
 impl Default for Config {
@@ -168,6 +172,7 @@ impl Default for Config {
             desktop_avoid: false,
             render_mode: RenderMode::default(),
             version: 3,
+            thumbnails: true,
         }
     }
 }
