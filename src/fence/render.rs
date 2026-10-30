@@ -374,6 +374,64 @@ unsafe fn draw_page_dots(g: *mut GpGraphics, f: &Fence, w: i32, h: i32) {
     }
 }
 
+/// 把预乘缩略图 source-over 到已预乘的 DIB。放在预乘 pass 之后,避免二次乘 alpha;
+/// `global`(幽灵淡出)在这里乘进源。越界行/列按网格内容区裁剪(翻页动画不串页)。
+unsafe fn blit_thumbs(
+    dst: *mut u32,
+    w: i32,
+    h: i32,
+    list: &[(i32, i32, std::sync::Arc<crate::thumbs::Thumb>)],
+    global: u32,
+    ctop: i32,
+    cbot: i32,
+) {
+    for (ix, iy, t) in list {
+        let n = t.px;
+        for y in 0..n {
+            let dy = iy + y;
+            if dy < ctop || dy >= cbot || dy < 0 || dy >= h {
+                continue;
+            }
+            for x in 0..n {
+                let dx = ix + x;
+                if dx < 0 || dx >= w {
+                    continue;
+                }
+                let s = t.data[(y * n + x) as usize];
+                let mut sa = (s >> 24) & 0xFF;
+                if sa == 0 {
+                    continue;
+                }
+                let mut sr = (s >> 16) & 0xFF;
+                let mut sg = (s >> 8) & 0xFF;
+                let mut sb = s & 0xFF;
+                if global != 255 {
+                    sa = sa * global / 255;
+                    sr = sr * global / 255;
+                    sg = sg * global / 255;
+                    sb = sb * global / 255;
+                }
+                let d = &mut *dst.add((dy * w + dx) as usize);
+                if sa == 255 {
+                    // 不透明图(jpg/mp4 的常态):直接覆盖,省掉一次读改写
+                    *d = (255 << 24) | (sr << 16) | (sg << 8) | sb;
+                    continue;
+                }
+                let inv = 255 - sa;
+                let dv = *d;
+                let dr = ((dv >> 16) & 0xFF) * inv / 255;
+                let dg = ((dv >> 8) & 0xFF) * inv / 255;
+                let db = (dv & 0xFF) * inv / 255;
+                let da = ((dv >> 24) & 0xFF) * inv / 255;
+                *d = (((sa + da).min(255)) << 24)
+                    | (((sr + dr).min(255)) << 16)
+                    | (((sg + dg).min(255)) << 8)
+                    | (sb + db).min(255);
+            }
+        }
+    }
+}
+
 /// 渲染一帧。分层:背景每像素透明度(opacity)+ 幽灵淡出(global),画进缓存并 ULW 整幅提交
 /// (半透明像素真透明透出桌面,圆角由 DWM 裁)。
 /// 亚克力:不画背景(整块透系统材质)、忽略 ghost/opacity(取舍:常亮),内容同样画进
@@ -543,6 +601,8 @@ fn paint_core(
         // 变成不透明黑块(实测整个 256² 位图 trans=0),DrawIconEx 走系统原生掩码/alpha,
         // 对 1-bit、32bpp、PNG 压缩图标都正确。
         let mut icons_to_draw: Vec<(i32, i32, HICON)> = Vec::new();
+        // 缩略图:预乘后的正方形画布,在预乘 pass 之后直接 source-over 进 DIB
+        let mut thumbs_to_draw: Vec<(i32, i32, std::sync::Arc<crate::thumbs::Thumb>)> = Vec::new();
         // 图标 GDI 裁剪区用到的行数(网格块内的 rows 出块即失效,提到函数级)
         let mut grid_rows: i32 = 0;
         if !f.entries.is_empty() {
@@ -614,12 +674,17 @@ fn paint_core(
                                 if f.selected == Some(idx2) { 0x55FFFFFF } else { 0x22FFFFFF },
                             );
                         }
-                        // 图标:收集位置,稍后由 GDI DrawIconEx 直绘(原生 alpha,透明区正确)
-                        let hicon = icons.get(&e.path);
-                        if !hicon.is_invalid() {
-                            let ix = (x + (cell_w - icon(f) as f32) / 2.0).round() as i32;
-                            let iy = y.round() as i32;
-                            icons_to_draw.push((ix, iy, hicon));
+                        // 缩略图优先:命中就直接贴图;未命中/不支持的类型退回系统图标。
+                        // 未命中时后台线程已在排队,本帧先画图标顶着(无闪烁)。
+                        let ix = (x + (cell_w - icon(f) as f32) / 2.0).round() as i32;
+                        let iy = y.round() as i32;
+                        if let Some(t) = icons.thumb(&e.path, icon(f)) {
+                            thumbs_to_draw.push((ix, iy, t));
+                        } else {
+                            let hicon = icons.get(&e.path);
+                            if !hicon.is_invalid() {
+                                icons_to_draw.push((ix, iy, hicon));
+                            }
                         }
                         // 名称(仿桌面图标:白字 + 投影 + 省略号,放不下两行)
                         let label_rect = RectF {
@@ -744,6 +809,12 @@ fn paint_core(
             .map(|started| started.elapsed())
             .unwrap_or_default();
 
+        // 缩略图必须放在预乘**之后**:源已是预乘值,再走上面的直通→预乘会二次乘 alpha
+        // (半透明边发暗)。global(幽灵淡出)在这里直接乘进源,效果与上面的处理一致。
+        if !thumbs_to_draw.is_empty() {
+            blit_thumbs(px, w, h, &thumbs_to_draw, g, ctop, cbot);
+        }
+
         // 提交:两种模式都是"整幅替换",内容移动不留残影(见 dcomp 模块头注释)。
         let submit_started = profiling.then(Instant::now);
         if acrylic {
@@ -765,4 +836,64 @@ fn paint_core(
             .unwrap_or_default();
     }
     profiling.then_some(sample)
+}
+
+#[cfg(test)]
+mod thumb_blit_tests {
+    use super::blit_thumbs;
+    use crate::thumbs::Thumb;
+    use std::sync::Arc;
+
+    fn px(a: u32, r: u32, g: u32, b: u32) -> u32 {
+        (a << 24) | (r << 16) | (g << 8) | b
+    }
+
+    fn thumb(px_size: i32, fill: u32) -> Arc<Thumb> {
+        Arc::new(Thumb {
+            px: px_size,
+            data: vec![fill; (px_size * px_size) as usize],
+        })
+    }
+
+    #[test]
+    fn opaque_thumb_overwrites_only_its_rect() {
+        let mut dst = vec![px(0, 0x11, 0x22, 0x33); 16];
+        let list = vec![(1, 1, thumb(2, px(255, 255, 0, 0)))];
+        unsafe { blit_thumbs(dst.as_mut_ptr(), 4, 4, &list, 255, 0, 4) };
+        assert_eq!(dst[0], px(0, 0x11, 0x22, 0x33));
+        assert_eq!(dst[1 * 4 + 1], px(255, 255, 0, 0));
+        assert_eq!(dst[2 * 4 + 2], px(255, 255, 0, 0));
+        assert_eq!(dst[3 * 4 + 3], px(0, 0x11, 0x22, 0x33));
+    }
+
+    #[test]
+    fn semi_transparent_thumb_composites_over_background() {
+        let mut dst = vec![px(0, 0x11, 0x22, 0x33); 4];
+        // 预乘后的半透明红:A=128,R=128
+        let list = vec![(0, 0, thumb(2, px(128, 128, 0, 0)))];
+        unsafe { blit_thumbs(dst.as_mut_ptr(), 2, 2, &list, 255, 0, 2) };
+        let expect = px(128, 128 + 0x11 * 127 / 255, 0x22 * 127 / 255, 0x33 * 127 / 255);
+        assert_eq!(dst[0], expect);
+    }
+
+    #[test]
+    fn clips_to_grid_content_rows() {
+        let mut dst = vec![0u32; 16];
+        let list = vec![(0, 0, thumb(4, px(255, 255, 255, 255)))];
+        // 只允许 2..4 行
+        unsafe { blit_thumbs(dst.as_mut_ptr(), 4, 4, &list, 255, 2, 4) };
+        assert_eq!(dst[0], 0);
+        assert_eq!(dst[1 * 4], 0);
+        assert_eq!(dst[2 * 4], px(255, 255, 255, 255));
+        assert_eq!(dst[3 * 4 + 3], px(255, 255, 255, 255));
+    }
+
+    #[test]
+    fn ghost_fade_scales_the_thumbnail_alpha() {
+        let mut dst = vec![0u32; 4];
+        let list = vec![(0, 0, thumb(2, px(255, 255, 255, 255)))];
+        // global=0 → 源 alpha 归零,整块跳过
+        unsafe { blit_thumbs(dst.as_mut_ptr(), 2, 2, &list, 0, 0, 2) };
+        assert_eq!(dst[0], 0);
+    }
 }

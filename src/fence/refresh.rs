@@ -81,6 +81,9 @@ pub(crate) fn restart_refresh_timer(hwnd: HWND, delay_ms: u32) -> bool {
 pub(crate) fn refresh_fence_now(g: &mut Global, idx: usize) {
     let ghost = g.config.ghost_mode;
     let vault = crate::config::vault_dir(&g.config);
+    let dir = g.fences[idx].cfg.folder.clone().unwrap_or_else(|| vault.clone());
+    // 目录变了 → 该目录下的缩略图缓存作废(被替换的图片要显示新内容)
+    g.icons.forget_thumbs_in(&dir);
     let f = &mut g.fences[idx];
     refresh_entries(f, &vault);
     render_fence(&mut g.icons, ghost, f);
