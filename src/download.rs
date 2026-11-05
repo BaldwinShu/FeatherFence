@@ -51,6 +51,7 @@ pub(crate) fn ensure_download_box(g: &mut Global) {
         opacity: 0.7,
         icon: 32,
         pos_set: None,
+        order: Vec::new(),
     };
     let id = create_fence(g, cfg);
     if id != 0 {
@@ -179,8 +180,13 @@ pub(crate) fn download_tick(g: &mut Global) {
         g.download_seen.remove(&path);
     }
     if let Some(id) = g.config.download_box_id {
-        if let Some(f) = g.fences.iter_mut().find(|f| f.valid && f.cfg.id == id) {
-            fence::refresh_entries(f, &config::vault_dir(&g.config));
+        if let Some(idx) = g.fences.iter().position(|f| f.valid && f.cfg.id == id) {
+            let fresh = {
+                let f = &mut g.fences[idx];
+                fence::refresh_entries(f, &config::vault_dir(&g.config))
+            };
+            fence::arm_icon_recheck(g, idx, fresh);
+            let f = &mut g.fences[idx];
             fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
         }
     }

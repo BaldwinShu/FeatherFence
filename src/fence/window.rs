@@ -48,7 +48,7 @@ use super::grid::{
 use super::menu::{fence_menu, rename_fence};
 use super::refresh::{
     refresh_entries, refresh_fence_now, restart_refresh_timer, stop_refresh_timer,
-    REFRESH_DEBOUNCE_MS, REFRESH_TICK,
+    ICON_RECHECK_TICK, REFRESH_DEBOUNCE_MS, REFRESH_TICK,
 };
 use super::render::{continue_perf_animation, render_fence};
 use super::{RefreshTimerAction, ResizeDir, WM_APP_DESKTOP_RESTORE, WM_APP_DROP, WM_APP_REFRESH};
@@ -865,6 +865,25 @@ unsafe extern "system" fn fence_wndproc(
                         if finished {
                             continue_perf_animation(f);
                         }
+                    }
+                });
+            } else if wparam.0 == ICON_RECHECK_TICK {
+                // 一次性:新条目落地 1s 后丢掉可能瞬态取到的图标并重绘一次(issue #41)
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), ICON_RECHECK_TICK);
+                }
+                with_global(|g| {
+                    if let Some(idx) = fence_idx(g, hwnd) {
+                        let paths = std::mem::take(&mut g.fences[idx].icon_recheck);
+                        if paths.is_empty() {
+                            return;
+                        }
+                        crate::dlog(&format!("[icon] 复核 {} 个新条目", paths.len()));
+                        // shell 侧可能也把通用图标记住了,先让它重读条目
+                        crate::icons::notify_shell_item_changed(&paths);
+                        g.icons.forget_paths(&paths);
+                        let ghost = g.config.ghost_mode;
+                        render_fence(&mut g.icons, ghost, &mut g.fences[idx]);
                     }
                 });
             } else if wparam.0 == BACKDROP_NUDGE_TICK {

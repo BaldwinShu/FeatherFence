@@ -461,8 +461,12 @@ unsafe extern "system" fn msg_wndproc(
                 let vault = config::vault_dir(&g.config);
                 let dir = g.fences[idx].cfg.folder.clone().unwrap_or_else(|| vault.clone());
                 g.icons.forget_thumbs_in(&dir);
+                let fresh = {
+                    let f = &mut g.fences[idx];
+                    fence::refresh_entries(f, &vault)
+                };
+                fence::arm_icon_recheck(g, idx, fresh);
                 let f = &mut g.fences[idx];
-                fence::refresh_entries(f, &vault);
                 fence::render_fence(&mut g.icons, ghost, f);
             }
         });
@@ -544,6 +548,7 @@ fn dispatch_menu(cmd: u32) {
                         opacity: 0.7,
                         icon: 32,
                         pos_set: None,
+                        order: Vec::new(),
                     };
                     create_fence(g, cfg);
                 }
@@ -590,6 +595,7 @@ fn dispatch_menu(cmd: u32) {
                         opacity: 0.7,
                         icon: 32,
                         pos_set: None,
+                        order: Vec::new(),
                     };
                     create_fence(g, cfg);
                 }
@@ -892,6 +898,7 @@ fn main() {
     };
     fence::set_icon_px(cfg.icon);
     fence::set_thumb_mode(cfg.thumbnails);
+    fence::set_hide_extensions(cfg.hide_extensions);
     fence::set_title_font_px(cfg.title_font_size);
     let vault = config::vault_dir(&cfg);
     let _ = std::fs::create_dir_all(&vault);
@@ -1007,6 +1014,7 @@ fn main() {
                 opacity: 0.74,
                 icon: 32,
                 pos_set: None,
+                order: Vec::new(),
             };
             // 创建成功才保存,避免失败时把配置覆盖成空
             if create_fence(g, box_cfg) != 0 {

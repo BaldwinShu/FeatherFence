@@ -216,8 +216,13 @@ pub(crate) fn shortcut_tick(g: &mut Global) {
         return;
     }
     for id in moved_to {
-        if let Some(f) = g.fences.iter_mut().find(|f| f.valid && f.cfg.id == id) {
-            fence::refresh_entries(f, &config::vault_dir(&g.config));
+        if let Some(idx) = g.fences.iter().position(|f| f.valid && f.cfg.id == id) {
+            let fresh = {
+                let f = &mut g.fences[idx];
+                fence::refresh_entries(f, &config::vault_dir(&g.config))
+            };
+            fence::arm_icon_recheck(g, idx, fresh);
+            let f = &mut g.fences[idx];
             fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
         }
     }

@@ -54,6 +54,11 @@ pub struct FenceCfg {
     /// 图标尺寸(旧版存于栅栏上;现由 Config.icon 全局统一。保留字段仅用于一次性迁移)
     #[serde(default = "default_icon")]
     pub icon: u32,
+    /// 自定义排序(每个栅栏独立):按文件名记录的顺序,大小写不敏感。
+    /// 空 = 默认排序(文件夹优先 + 名称)。不在列表里的条目(新拖入/改名)
+    /// 排到末尾,旧名字留在列表里无害。
+    #[serde(default)]
+    pub order: Vec<String>,
 }
 
 fn default_opacity() -> f32 {
@@ -95,6 +100,7 @@ impl Default for FenceCfg {
             opacity: default_opacity(),
             icon: default_icon(),
             pos_set: None,
+            order: Vec::new(),
         }
     }
 }
@@ -153,6 +159,10 @@ pub struct Config {
     /// 缩略图画在当前图标尺寸上,网格槽位与容量不变。
     #[serde(default = "default_true")]
     pub thumbnails: bool,
+    /// 隐藏文件扩展名:只影响图标下的标签显示(`报告.docx` → `报告`),
+    /// 文件夹与非文件条目不动;真实文件名/排序/打开方式完全不变。
+    #[serde(default = "default_true")]
+    pub hide_extensions: bool,
 }
 
 impl Default for Config {
@@ -173,6 +183,7 @@ impl Default for Config {
             render_mode: RenderMode::default(),
             version: 3,
             thumbnails: true,
+            hide_extensions: true,
         }
     }
 }
@@ -213,6 +224,29 @@ pub fn scale_extent_for_dpi(value: i32, saved_dpi: u32, current_dpi: u32) -> i32
 #[cfg(test)]
 mod render_mode_tests {
     use super::*;
+
+    #[test]
+    fn missing_hide_extensions_defaults_to_hidden() {
+        // 旧配置没有该字段 → 跟随资源管理器习惯,默认隐藏扩展名
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(c.hide_extensions);
+    }
+
+    #[test]
+    fn missing_custom_order_defaults_to_empty_and_roundtrips() {
+        // 旧配置没有 order 字段 → 空 = 默认排序(行为不变)
+        let old = r#"{"id":1,"title":"t","folder":null,"x":0,"y":0,"w":260,"h":340}"#;
+        let fence: FenceCfg = serde_json::from_str(old).unwrap();
+        assert!(fence.order.is_empty());
+
+        let fence = FenceCfg {
+            order: vec!["b.txt".into(), "a.txt".into()],
+            ..FenceCfg::default()
+        };
+        let json = serde_json::to_string(&fence).unwrap();
+        let back: FenceCfg = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.order, vec!["b.txt".to_string(), "a.txt".to_string()]);
+    }
 
     #[test]
     fn missing_render_mode_defaults_to_layered_and_roundtrips() {

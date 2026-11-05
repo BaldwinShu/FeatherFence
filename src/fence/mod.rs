@@ -10,6 +10,7 @@ pub mod dcomp;
 mod geometry;
 mod grid;
 mod menu;
+mod order;
 mod refresh;
 mod render;
 mod window;
@@ -28,11 +29,12 @@ use render::RenderCache;
 
 // 对外 API 重导出:保持 crate::fence::X 全部调用点不变
 pub use geometry::{
-    dpi_scale, min_h, min_w, set_icon_px, set_thumb_mode, set_title_font_px, thumb_mode,
-    window_dpi,
+    dpi_scale, min_h, min_w, set_hide_extensions, set_icon_px, set_thumb_mode,
+    set_title_font_px, thumb_mode, window_dpi,
 };
 pub use grid::{config_snapshot, settle_fence};
 pub(crate) use menu::prompt_text;
+pub(crate) use refresh::arm_icon_recheck;
 pub use refresh::refresh_entries;
 pub use render::{render_fence, start_perf_animation};
 pub use window::{create_window, register_class, schedule_render};
@@ -50,6 +52,9 @@ pub struct Entry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
+    /// 目录枚举时顺带拿到的文件指纹(修改时间 + 大小),图标缓存失效判断用。
+    /// Windows 上 `DirEntry::metadata` 读的是枚举缓存,不额外产生 IO。
+    pub stamp: crate::icons::FileStamp,
 }
 
 struct RefreshState {
@@ -189,6 +194,12 @@ pub struct Fence {
     pub drag_down: (i32, i32),
     /// 目录监听线程与窗口消息之间的刷新合并信号。
     pub refresh_signal: RefreshSignal,
+    /// 本次刷新新出现、待一秒后复核图标的路径(issue #41:落地瞬间 shell 可能
+    /// 给出通用图标,复核时丢掉重取)。
+    pub icon_recheck: Vec<PathBuf>,
+    /// 是否完成过至少一次目录扫描。首次装载不算"新出现":那时文件不是刚落地,
+    /// 不需要整箱复核图标。
+    scanned_once: bool,
     /// 已渲染 DIB 缓存:整幅提交的源(内容不保留,必须自己存)。
     /// 分层 = UpdateLayeredWindow 提交;亚克力 = BitBlt 进 DirectComposition 表面。
     cache: Option<RenderCache>,
@@ -221,6 +232,8 @@ impl Fence {
             drag_idx: None,
             drag_down: (0, 0),
             refresh_signal: RefreshSignal::default(),
+            icon_recheck: Vec::new(),
+            scanned_once: false,
             cache: None,
             backdrop: None,
             valid: true,

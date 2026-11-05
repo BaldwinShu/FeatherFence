@@ -13,8 +13,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindow, LoadCursorW, MessageBoxW, RegisterClassW, SendMessageW, SetForegroundWindow,
     ShowWindow, TrackPopupMenu, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_DBLCLKS, ES_AUTOHSCROLL,
     HMENU, IDC_ARROW, IDOK, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_OKCANCEL,
-    MESSAGEBOX_STYLE, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SW_SHOW, SW_SHOWNORMAL,
-    TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage, WM_CLOSE, WM_COMMAND, WM_SETFONT,
+    MESSAGEBOX_STYLE, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SW_SHOW,
+    SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage, WM_CLOSE, WM_COMMAND, WM_SETFONT,
     WINDOW_STYLE, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME,
     WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
@@ -23,8 +23,9 @@ use crate::release::{self, ReleaseAction};
 use crate::utils::wstr;
 use crate::with_global;
 
-use super::geometry::{set_icon_px, set_thumb_mode, set_title_font_px};
+use super::geometry::{set_hide_extensions, set_icon_px, set_thumb_mode, set_title_font_px};
 use super::grid::{config_snapshot, settle_fence, sync_page};
+use super::order::{self, OrderAction};
 use super::render::render_fence;
 use super::window::fence_idx;
 
@@ -49,6 +50,30 @@ pub fn fence_menu(hwnd: HWND) {
         }
         let _ = AppendMenuW(menu, MF_STRING, 1011, PCWSTR(w!("打开收纳箱").as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, 1005, PCWSTR(w!("重命名...").as_ptr()));
+        // 自定义排序(每个栅栏独立):作用于当前选中项(右键图标会先选中它)
+        let (can_up, can_down, has_order) = with_global(|g| {
+            fence_idx(g, hwnd)
+                .map(|i| order::menu_state(g, i))
+                .unwrap_or((false, false, false))
+        });
+        let order_flags = |on: bool| if on { MF_STRING } else { MF_STRING | MF_GRAYED };
+        let order_menu = CreatePopupMenu().unwrap_or_default();
+        let _ = AppendMenuW(order_menu, order_flags(can_up), 1022, PCWSTR(w!("上移").as_ptr()));
+        let _ = AppendMenuW(order_menu, order_flags(can_down), 1023, PCWSTR(w!("下移").as_ptr()));
+        let _ = AppendMenuW(order_menu, order_flags(can_up), 1024, PCWSTR(w!("置顶").as_ptr()));
+        let _ = AppendMenuW(order_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(
+            order_menu,
+            order_flags(has_order),
+            1025,
+            PCWSTR(w!("恢复默认排序").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            order_menu.0 as usize,
+            PCWSTR(w!("自定义排序").as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let cur_opacity = with_global(|g| {
             fence_idx(g, hwnd)
@@ -131,6 +156,10 @@ pub fn fence_menu(hwnd: HWND) {
         let thumb_on = with_global(|g| g.config.thumbnails);
         let thumb_flags = if thumb_on { MF_STRING | MF_CHECKED } else { MF_STRING };
         let _ = AppendMenuW(menu, thumb_flags, 1020, PCWSTR(w!("缩略图").as_ptr()));
+        // 隐藏扩展名(全局):只换标签显示名,真实文件名/排序/打开方式不变
+        let hide_ext = with_global(|g| g.config.hide_extensions);
+        let hide_ext_flags = if hide_ext { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let _ = AppendMenuW(menu, hide_ext_flags, 1021, PCWSTR(w!("隐藏扩展名").as_ptr()));
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let cmd = TrackPopupMenu(
@@ -405,6 +434,29 @@ pub fn fence_menu(hwnd: HWND) {
                     }
                 }
                 crate::config::save(&g.config);
+            });
+        } else if cmd == 1021 {
+            with_global(|g| {
+                g.config.hide_extensions = !g.config.hide_extensions;
+                set_hide_extensions(g.config.hide_extensions);
+                // 只换标签文本,不动网格/尺寸(同缩略图切换:不 settle、不触发图标避让)
+                let ghost = g.config.ghost_mode;
+                for i in 0..g.fences.len() {
+                    if g.fences[i].valid {
+                        render_fence(&mut g.icons, ghost, &mut g.fences[i]);
+                    }
+                }
+                crate::config::save(&g.config);
+            });
+        } else if matches!(cmd, 1022..=1025) {
+            with_global(|g| {
+                let Some(idx) = fence_idx(g, hwnd) else { return };
+                match cmd {
+                    1022 => order::move_selected(g, idx, OrderAction::Up),
+                    1023 => order::move_selected(g, idx, OrderAction::Down),
+                    1024 => order::move_selected(g, idx, OrderAction::Top),
+                    _ => order::reset_order(g, idx),
+                }
             });
         }
     }
