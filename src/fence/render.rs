@@ -29,7 +29,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::utils::wstr;
 
 use super::geometry::{
-    cell_h, font_label, font_title, icon, label_h, margin, rail, title_h, FONT_NAME,
+    cell_h, font_label, font_title, hide_extensions, icon, label_h, margin, rail, title_h,
+    FONT_NAME,
 };
 use super::dcomp;
 use super::grid::{grid_dims, start_page_anim, step_page_anim, total_pages};
@@ -271,6 +272,18 @@ unsafe fn draw_label_line(
 
 /// 文件名称:仿 Windows 桌面图标标签 —— 白色文字 + 紧实深色描边,
 /// 单行放得下就单行,放不下自动两行,末行超长由 fmt 的省略号裁剪。
+/// 标签显示名:隐藏扩展名时去掉扩展名(`微信.lnk` → `微信`),文件夹不动。
+/// 只影响绘制 —— `Entry.name` 仍是真实文件名,排序/路径/系统菜单都用它。
+fn display_name(name: &str, is_dir: bool) -> &str {
+    if is_dir || !hide_extensions() {
+        return name;
+    }
+    match std::path::Path::new(name).file_stem() {
+        Some(stem) if !stem.is_empty() => stem.to_str().unwrap_or(name),
+        _ => name,
+    }
+}
+
 unsafe fn draw_label(
     g: *mut GpGraphics,
     font: *const GpFont,
@@ -681,7 +694,7 @@ fn paint_core(
                         if let Some(t) = icons.thumb(&e.path, icon(f)) {
                             thumbs_to_draw.push((ix, iy, t));
                         } else {
-                            let hicon = icons.get(&e.path);
+                            let hicon = icons.get(&e.path, e.stamp);
                             if !hicon.is_invalid() {
                                 icons_to_draw.push((ix, iy, hicon));
                             }
@@ -701,7 +714,7 @@ fn paint_core(
                             meas_fmt,
                             shadow_brush as *const GpBrush,
                             label_brush as *const GpBrush,
-                            &e.name,
+                            display_name(&e.name, e.is_dir),
                             label_rect,
                             f.animating,
                         );
@@ -836,6 +849,29 @@ fn paint_core(
             .unwrap_or_default();
     }
     profiling.then_some(sample)
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::display_name;
+    use crate::fence::geometry::set_hide_extensions;
+
+    #[test]
+    fn hidden_extensions_strip_only_file_labels() {
+        set_hide_extensions(true);
+        assert_eq!(display_name("微信.lnk", false), "微信");
+        assert_eq!(display_name("报告.docx", false), "报告");
+        // 多段扩展名只去掉最后一段(和资源管理器一致)
+        assert_eq!(display_name("archive.tar.gz", false), "archive.tar");
+        // 没有扩展名 / 以点开头的名字原样保留
+        assert_eq!(display_name("README", false), "README");
+        assert_eq!(display_name(".gitignore", false), ".gitignore");
+        // 文件夹永不截断
+        assert_eq!(display_name("资料.lnk", true), "资料.lnk");
+
+        set_hide_extensions(false);
+        assert_eq!(display_name("微信.lnk", false), "微信.lnk");
+    }
 }
 
 #[cfg(test)]

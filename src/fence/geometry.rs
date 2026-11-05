@@ -35,6 +35,9 @@ static ICON_PX: AtomicU32 = AtomicU32::new(32);
 /// 缩略图模式:媒体文件用缩略图替代图标。**只换绘制内容,不改网格槽位**——
 /// 缩略图就画在当前图标尺寸上,容量与图标模式完全一致。
 static THUMB_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 隐藏扩展名:只影响标签的显示文本。`Entry.name`、排序、路径映射、
+/// 双击/拖出/系统菜单全部仍用真实文件名。
+static HIDE_EXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 全局栅栏标题字号(逻辑像素):所有栅栏统一
 static TITLE_FONT_PX: AtomicU32 = AtomicU32::new(12);
 /// 设置全局图标尺寸(物理显示时再乘 DPI)
@@ -47,6 +50,13 @@ pub fn set_thumb_mode(on: bool) {
 }
 pub fn thumb_mode() -> bool {
     THUMB_MODE.load(AtomicOrdering::Relaxed)
+}
+/// 切换"隐藏扩展名"(只换标签显示文本,不改任何身份/排序信息)
+pub fn set_hide_extensions(on: bool) {
+    HIDE_EXT.store(on, AtomicOrdering::Relaxed);
+}
+pub fn hide_extensions() -> bool {
+    HIDE_EXT.load(AtomicOrdering::Relaxed)
 }
 /// 设置全局栅栏标题字号(物理显示时再乘 DPI)
 pub fn set_title_font_px(v: u32) {
